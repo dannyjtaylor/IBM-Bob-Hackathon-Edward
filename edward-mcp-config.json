@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "edward": {
+      "command": "python",
+      "args": ["mcp_server.py"],
+      "cwd": "c:/Users/danny/OneDrive/Documents/GitHub/Bob/IBM-Bob-Hackathon-Edward",
+      "env": {}
+    }
+  }
+}
