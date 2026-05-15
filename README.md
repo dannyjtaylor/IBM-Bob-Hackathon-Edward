@@ -12,6 +12,8 @@ Edward is a local Windows desktop AI assistant inspired by Jarvis from Iron Man.
 - 🔒 **Local Password Vault**: Encrypted password manager (never sent to APIs)
 - 💾 **Session History**: Tracks all interactions locally
 - 🤖 **IBM Bob Integration**: Powered by IBM Bob AI via API
+- 🖱️ **Computer Control**: Direct mouse and keyboard control via local API
+- 🤖 **Autonomous Control**: AI-driven computer control with IBM Watsonx Vision
 
 ## Color Palette
 
@@ -34,6 +36,8 @@ Edward is a local Windows desktop AI assistant inspired by Jarvis from Iron Man.
 - **ElevenLabs** - Text-to-speech
 - **SQLite** - Local database
 - **cryptography** - Password encryption
+- **FastAPI** - Computer control API
+- **PyAutoGUI** - Mouse and keyboard automation
 
 ## Installation
 
@@ -108,24 +112,30 @@ Edward is a local Windows desktop AI assistant inspired by Jarvis from Iron Man.
 
 ```
 Edward/
-├── main.py              # Main entry point
-├── agent.py             # Hotkey listener & screenshot capture
-├── overlay.py           # PyQt6 overlay UI
-├── tts.py               # ElevenLabs text-to-speech
-├── stt.py               # Faster-whisper speech-to-text
-├── wake_word.py         # OpenWakeWord detection
-├── api_client.py        # IBM Bob API client
-├── database.py          # Session history database
-├── vault.py             # Encrypted password vault
-├── config.py            # Configuration management
-├── requirements.txt     # Python dependencies
-├── .env.example         # Environment template
-├── data/                # Local data storage
-│   ├── edward.db        # Session history
-│   └── vault.db         # Password vault
-├── logs/                # Application logs
-│   └── edward.log
-└── assets/              # Icons and resources
+├── main.py                      # Main entry point
+├── agent.py                     # Hotkey listener & screenshot capture
+├── overlay.py                   # PyQt6 overlay UI
+├── tts.py                       # ElevenLabs text-to-speech
+├── stt.py                       # Faster-whisper speech-to-text
+├── wake_word.py                 # OpenWakeWord detection
+├── api_client.py                # IBM Bob API client
+├── computer_control_api.py      # FastAPI computer control server
+├── control_client.py            # Computer control API client
+├── start_control_api.py         # Control API startup script
+├── test_computer_control.py     # Control API test suite
+├── database.py                  # Session history database
+├── vault.py                     # Encrypted password vault
+├── config.py                    # Configuration management
+├── requirements.txt             # Python dependencies
+├── .env.example                 # Environment template
+├── COMPUTER_CONTROL_GUIDE.md    # Computer control documentation
+├── data/                        # Local data storage
+│   ├── edward.db                # Session history
+│   └── vault.db                 # Password vault
+├── logs/                        # Application logs
+│   ├── edward.log
+│   └── control_api.log
+└── assets/                      # Icons and resources
 ```
 
 ## Personality
@@ -165,11 +175,111 @@ python tts.py
 3. Integrate with Edward class
 4. Update configuration in `config.py`
 
+## Computer Control
+
+Edward now includes a powerful computer control system that allows direct mouse and keyboard automation:
+
+### Quick Start
+
+1. **Start the Control API:**
+   ```bash
+   python start_control_api.py
+   ```
+
+2. **Test the API:**
+   ```bash
+   python test_computer_control.py
+   ```
+
+3. **Use in your code:**
+   ```python
+   from control_client import get_control_client
+   
+   client = get_control_client()
+   client.move_mouse(500, 300)
+   client.click_mouse()
+   client.type_text("Hello, World!")
+   ```
+
+For detailed documentation, see [COMPUTER_CONTROL_GUIDE.md](COMPUTER_CONTROL_GUIDE.md)
+
+## Autonomous Computer Control (NEW! 🚀)
+
+Edward now features AI-driven autonomous computer control with **two options**:
+
+### Option 1: Local AI with Ollama (Recommended) 🏠
+
+Run everything locally on your laptop - no cloud, no API costs, complete privacy!
+
+**Quick Start:**
+1. Install Ollama from https://ollama.ai
+2. Download model: `ollama pull llava:13b`
+3. Start Control API: `python start_control_api.py`
+4. Run Demo: `python demo_ollama_control.py`
+
+**Perfect for your Intel Arc 140V GPU (8GB) + 16GB RAM!**
+
+**Documentation:**
+- [Quick Start (5 min)](QUICKSTART_OLLAMA.md) - Get running fast
+- [Full Setup Guide](OLLAMA_SETUP_GUIDE.md) - Complete instructions
+
+### Option 2: Cloud AI with IBM Watsonx ☁️
+
+Use IBM's cloud-based vision AI (requires API key).
+
+**Quick Start:**
+1. Get credentials from [IBM Cloud](https://cloud.ibm.com/)
+2. Configure `.env` with `WATSONX_API_KEY` and `WATSONX_PROJECT_ID`
+3. Start Control API: `python start_control_api.py`
+4. Run Demo: `python demo_autonomous_control.py`
+
+**Documentation:**
+- [Quick Start Guide](QUICKSTART_AUTONOMOUS_CONTROL.md)
+- [Full Documentation](AUTONOMOUS_CONTROL_GUIDE.md)
+
+### Features (Both Options)
+
+- 📸 **Periodic Screenshots**: Captures screen every 2 seconds (configurable)
+- 🧠 **AI Vision Analysis**: Understands what's on your screen
+- 🎯 **Smart Actions**: AI decides mouse movements, clicks, typing, etc.
+- 🔒 **Safety Controls**: Manual confirmation mode, failsafe features
+- 📊 **Action History**: Track all AI decisions and actions
+
+### Example: Local Ollama
+
+```python
+from ollama_control_processor import OllamaAutonomousLoop
+
+# Create autonomous control loop
+control_loop = OllamaAutonomousLoop(
+    task_description="Open Notepad and type 'Hello World'",
+    ollama_model="llava:13b",
+    screenshot_interval=2.0,
+    auto_execute=True
+)
+
+# Start AI control
+await control_loop.start()
+```
+
+### Comparison
+
+| Feature | Ollama (Local) | Watsonx (Cloud) |
+|---------|----------------|-----------------|
+| Cost | ✅ FREE | ❌ Pay per API call |
+| Privacy | ✅ 100% Local | ⚠️ Data sent to cloud |
+| Speed | ✅ Fast (no network) | ⚠️ Network dependent |
+| Setup | ⚠️ Requires GPU | ✅ No GPU needed |
+| Quality | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐ |
+
+**Recommendation**: Use Ollama for privacy, cost savings, and speed!
+
 ## Roadmap
 
+- [x] Computer control API with mouse/keyboard automation
+- [x] Autonomous AI-driven computer control with Watsonx Vision
 - [ ] Wake word detection implementation
 - [ ] Speech-to-text integration
-- [ ] Computer control actions (file creation, app launching)
 - [ ] Settings UI
 - [ ] Multi-monitor support
 - [ ] Custom voice training
