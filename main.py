@@ -26,6 +26,7 @@ from tts import get_tts
 from widgets.acting_indicator import ActingIndicator
 from stt import get_stt
 from api_client import get_api_client
+from context_enhancer import get_context_enhancer
 from config import USER_NAME, COLORS
 from logger import setup_logger
 
@@ -78,6 +79,7 @@ class Edward:
         self.tts = get_tts()
         self.stt = get_stt()
         self.api_client = get_api_client()
+        self.context_enhancer = get_context_enhancer()
         
         # Connect signals
         self.overlay.question_submitted.connect(self._on_question_submitted)
@@ -169,11 +171,26 @@ class Edward:
             # Clear previous response
             self.overlay.response_area.clear()
             
+            # Build enhanced prompt with context (clipboard, conversation history, etc.)
+            logger.info("Building enhanced prompt with context...")
+            enhanced_prompt, context_metadata = self.context_enhancer.build_enhanced_prompt(
+                user_question=question,
+                screenshot_base64=screenshot_base64,
+                include_clipboard=True,
+                conversation_history=None  # TODO: Add conversation history from database
+            )
+            
+            # Log what context was included
+            if context_metadata.get('clipboard_included'):
+                logger.info(f"Clipboard context added: {context_metadata['clipboard_type']}")
+            if context_metadata.get('screenshot_included'):
+                logger.info("Screenshot context included")
+            
             # Try to connect to Bob API
             full_response = ""
             try:
                 async for chunk in self.api_client.ask_question(
-                    question=question,
+                    question=enhanced_prompt,  # Use enhanced prompt instead of raw question
                     screenshot_base64=screenshot_base64,
                     stream=True
                 ):
