@@ -27,7 +27,7 @@ from widgets.acting_indicator import ActingIndicator
 from stt import get_stt
 from api_client import get_api_client
 from context_enhancer import get_context_enhancer
-from ui import PasswordUnlockDialog, PasswordManagerDialog
+from ui import PasswordUnlockDialog, PasswordManagerDialog, SettingsDialog
 from config import USER_NAME, COLORS
 from logger import setup_logger
 
@@ -307,8 +307,7 @@ In the meantime, I can provide basic responses. How can I assist you, {USER_NAME
             PasswordManagerDialog(vault).exec()
 
     def _show_settings(self):
-        """Show settings dialog (placeholder)"""
-        logger.info("Settings clicked (not implemented yet)")
+        SettingsDialog().exec()
     
     def _quit_app(self):
         """Quit the application"""
