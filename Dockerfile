@@ -1,5 +1,21 @@
 # Edward AI Assistant - Docker Image
-# Production-ready container for Windows/Linux/Mac
+#
+# ⚠️ WARNING: Edward is a GUI desktop application
+# Running it in Docker is NOT RECOMMENDED because:
+# - Requires X11/display forwarding (complex)
+# - Needs audio device passthrough
+# - Requires keyboard/mouse input
+# - Needs direct file system access
+#
+# RECOMMENDED: Run Edward natively on your desktop
+# See DOCKER_GUIDE.md for details
+#
+# This Dockerfile is provided for:
+# - Development/testing purposes
+# - Headless/API-only deployments (future)
+# - Reference implementation
+#
+# For production: Use docker-compose.bob-only.yml for Bob API only
 
 FROM python:3.11-slim
 

@@ -1,0 +1,79 @@
+# Docker Compose for Bob API Only
+# Edward should run natively on your desktop
+# This file deploys only the Bob API server
+
+version: '3.8'
+
+services:
+  bob-api:
+    # Replace with actual IBM Bob API image when available
+    # For now, this is a placeholder
+    image: ibm-bob-api:latest
+    container_name: bob-api
+    restart: unless-stopped
+    
+    ports:
+      - "6700:6700"
+    
+    environment:
+      # Bob API configuration
+      - BOB_API_PORT=6700
+      - BOB_API_HOST=0.0.0.0
+      
+      # Optional: Add your API keys here or use .env
+      - BOB_API_KEY=${BOB_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+    
+    volumes:
+      # Persist Bob's data
+      - bob-data:/app/data
+      
+      # Persist logs
+      - bob-logs:/app/logs
+      
+      # Optional: Mount config if needed
+      # - ./bob-config.json:/app/config.json:ro
+    
+    networks:
+      - bob-network
+    
+    # Resource limits (adjust based on your needs)
+    deploy:
+      resources:
+        limits:
+          cpus: '4.0'
+          memory: 8G
+        reservations:
+          cpus: '2.0'
+          memory: 4G
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6700/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+networks:
+  bob-network:
+    driver: bridge
+
+volumes:
+  bob-data:
+    driver: local
+  bob-logs:
+    driver: local
+
+# Usage:
+# 1. Start Bob API: docker-compose -f docker-compose.bob-only.yml up -d
+# 2. Check status: docker-compose -f docker-compose.bob-only.yml ps
+# 3. View logs: docker-compose -f docker-compose.bob-only.yml logs -f
+# 4. Stop: docker-compose -f docker-compose.bob-only.yml down
+#
+# Then run Edward natively:
+# python main.py
+#
+# Edward will connect to Bob API at http://localhost:6700
+
+# Made with Bob
