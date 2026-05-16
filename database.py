@@ -286,6 +286,17 @@ class EdwardDatabase:
             logger.error(f"Failed to search interactions: {e}")
             return []
 
+    def clear_history(self):
+        """Delete all sessions and interactions from the database."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute("DELETE FROM interactions")
+                conn.execute("DELETE FROM sessions")
+                conn.commit()
+            logger.info("Conversation history cleared")
+        except Exception as e:
+            logger.error(f"Failed to clear history: {e}")
+
 
 # Singleton instance
 _db_instance: Optional[EdwardDatabase] = None
