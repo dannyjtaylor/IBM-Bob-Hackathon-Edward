@@ -1,11 +1,11 @@
 # Core Dependencies
-PySide6==6.6.0
+PySide6>=6.6.0
 qasync==0.27.1
 pystray==0.19.5
-Pillow==10.2.0
+Pillow>=10.2.0
 pynput==1.7.6
 mss==9.0.1
-pygame==2.5.2
+pygame>=2.5.2
 pyautogui==0.9.54
 
 # MCP Server
@@ -15,6 +15,8 @@ mcp>=1.0.0
 SpeechRecognition==3.10.1
 PyAudio==0.2.14
 elevenlabs==0.2.27
+pvporcupine==3.0.2
+faster-whisper==1.0.0
 
 # IBM Watsonx
 ibm-watsonx-ai>=1.0.0
