@@ -1,175 +1,239 @@
 """
 Edward Agent Module
-Handles global hotkey listening and screenshot capture
+Handles global hotkey listening and multi-mode screenshot capture.
 """
 
+import ctypes
+import ctypes.wintypes
 import io
 import base64
-from typing import Callable, Optional
+from typing import Callable, Optional, Tuple
 from pynput import keyboard
+from pynput.mouse import Controller as MouseController
 from mss import mss
-from PIL import Image
+from PIL import Image, ImageDraw
 
-from config import HOTKEY_ENABLED, HOTKEY_COMBINATION
+from config import HOTKEY_ENABLED, HOTKEY_COMBINATION, ScreenshotMode, CURSOR_REGION_SIZE
 from logger import get_logger
 
-# Setup logging
 logger = get_logger(__name__)
+
+
+def _get_foreground_window_rect() -> Tuple[int, int, int, int]:
+    """Return (left, top, width, height) of the current foreground window."""
+    user32 = ctypes.windll.user32
+    hwnd = user32.GetForegroundWindow()
+    rect = ctypes.wintypes.RECT()
+    user32.GetWindowRect(hwnd, ctypes.byref(rect))
+    left   = rect.left
+    top    = rect.top
+    width  = rect.right  - rect.left
+    height = rect.bottom - rect.top
+    return left, top, width, height
 
 
 class EdwardAgent:
     """
-    Main agent class that listens for hotkey triggers and captures screenshots.
-    Triggers the overlay UI when activated.
+    Listens for the global hotkey and captures screenshots in one of three modes:
+      • CURSOR_REGION — ~1 000 px square around the mouse pointer (fast, focused)
+      • ACTIVE_WINDOW — the foreground window (medium)
+      • FULL_SCREEN   — all monitors combined (slow, widest context)
     """
-    
+
     def __init__(self, on_trigger_callback: Optional[Callable] = None):
-        """
-        Initialize the Edward agent.
-        
-        Args:
-            on_trigger_callback: Function to call when hotkey is triggered
-        """
         self.on_trigger_callback = on_trigger_callback
         self.listener: Optional[keyboard.GlobalHotKeys] = None
         self.is_running = False
-        
-        logger.info("Edward Agent initialized")
-    
-    def capture_screenshot(self) -> tuple[bytes, str]:
+        self.mouse = MouseController()
+        self.screenshot_mode = ScreenshotMode.CURSOR_REGION
+        # HWND of the window that was foreground when Win+Shift+E fired.
+        # Used by capture_active_window so it never accidentally captures the overlay.
+        self._target_hwnd: Optional[int] = None
+        logger.info("Edward Agent initialised — multi-mode capture ready")
+
+    # ── Public capture API ────────────────────────────────────────────────────
+
+    def capture_for_mode(
+        self, mode: Optional[ScreenshotMode] = None
+    ) -> Tuple[bytes, str]:
         """
-        Capture a screenshot of all monitors and return as bytes and base64.
-        
-        Returns:
-            Tuple of (image_bytes, base64_string)
+        Capture a screenshot using the given mode (or self.screenshot_mode).
+        Returns (image_bytes, base64_string).
+        """
+        mode = mode or self.screenshot_mode
+        if mode == ScreenshotMode.CURSOR_REGION:
+            img_bytes, img_base64, _ = self.capture_cursor_region(CURSOR_REGION_SIZE)
+        elif mode == ScreenshotMode.ACTIVE_WINDOW:
+            img_bytes, img_base64 = self.capture_active_window()
+        else:
+            img_bytes, img_base64 = self.capture_full_screen()
+        return img_bytes, img_base64
+
+    def capture_cursor_region(
+        self, region_size: int = 1000
+    ) -> Tuple[bytes, str, Tuple[int, int]]:
+        """
+        Capture a square around the cursor and draw a gold crosshair at the cursor centre.
+        Returns (image_bytes, base64_string, cursor_position).
+        """
+        try:
+            cursor_x, cursor_y = self.mouse.position
+
+            with mss() as sct:
+                monitor = sct.monitors[0]
+                screen_w = monitor['width']
+                screen_h = monitor['height']
+
+                half = region_size // 2
+                left   = max(0, cursor_x - half)
+                top    = max(0, cursor_y - half)
+                right  = min(screen_w, cursor_x + half)
+                bottom = min(screen_h, cursor_y + half)
+
+                region = {'left': left, 'top': top, 'width': right - left, 'height': bottom - top}
+                shot   = sct.grab(region)
+                img    = Image.frombytes("RGB", (shot.width, shot.height), shot.rgb)
+
+                draw = ImageDraw.Draw(img)
+                rx = cursor_x - left
+                ry = cursor_y - top
+                r  = 12
+                draw.ellipse([rx - r, ry - r, rx + r, ry + r], outline='#DAA520', width=3)
+                draw.line([rx - r - 5, ry, rx + r + 5, ry], fill='#DAA520', width=2)
+                draw.line([rx, ry - r - 5, rx, ry + r + 5], fill='#DAA520', width=2)
+
+                img_bytes  = self._to_bytes(img)
+                img_base64 = base64.b64encode(img_bytes).decode()
+
+                logger.info(f"Cursor-region shot: {shot.width}×{shot.height} @ ({cursor_x},{cursor_y})")
+                return img_bytes, img_base64, (cursor_x, cursor_y)
+
+        except Exception as e:
+            logger.error(f"capture_cursor_region failed: {e}")
+            raise
+
+    def capture_active_window(self) -> Tuple[bytes, str]:
+        """
+        Capture the window that was in the foreground when Win+Shift+E fired.
+        Falls back to full-screen if the rect is degenerate.
+        Using _target_hwnd avoids accidentally capturing the overlay itself.
+        """
+        try:
+            if self._target_hwnd:
+                rect = ctypes.wintypes.RECT()
+                ctypes.windll.user32.GetWindowRect(self._target_hwnd, ctypes.byref(rect))
+                left   = rect.left
+                top    = rect.top
+                width  = rect.right  - rect.left
+                height = rect.bottom - rect.top
+            else:
+                left, top, width, height = _get_foreground_window_rect()
+
+            if width <= 0 or height <= 0:
+                logger.warning("Active window has zero size — falling back to full screen")
+                return self.capture_full_screen()
+
+            with mss() as sct:
+                monitor = sct.monitors[0]
+                # Clamp to screen bounds
+                left   = max(0, left)
+                top    = max(0, top)
+                width  = min(width,  monitor['width']  - left)
+                height = min(height, monitor['height'] - top)
+
+                region = {'left': left, 'top': top, 'width': width, 'height': height}
+                shot   = sct.grab(region)
+                img    = Image.frombytes("RGB", (shot.width, shot.height), shot.rgb)
+
+                img_bytes  = self._to_bytes(img)
+                img_base64 = base64.b64encode(img_bytes).decode()
+
+                logger.info(f"Active-window shot: {width}×{height}")
+                return img_bytes, img_base64
+
+        except Exception as e:
+            logger.error(f"capture_active_window failed: {e}")
+            raise
+
+    def capture_full_screen(self) -> Tuple[bytes, str]:
+        """
+        Capture all monitors as a single image.
+        Returns (image_bytes, base64_string).
         """
         try:
             with mss() as sct:
-                # Capture all monitors as one screenshot
-                monitor = sct.monitors[0]  # Monitor 0 is all monitors combined
-                screenshot = sct.grab(monitor)
-                
-                # Convert to PIL Image
-                img = Image.frombytes(
-                    "RGB",
-                    (screenshot.width, screenshot.height),
-                    screenshot.rgb
-                )
-                
-                # Convert to bytes
-                img_byte_arr = io.BytesIO()
-                img.save(img_byte_arr, format='PNG', optimize=True)
-                img_bytes = img_byte_arr.getvalue()
-                
-                # Convert to base64 for API transmission
-                img_base64 = base64.b64encode(img_bytes).decode('utf-8')
-                
-                logger.info(f"Screenshot captured: {screenshot.width}x{screenshot.height}")
+                monitor = sct.monitors[0]
+                shot    = sct.grab(monitor)
+                img     = Image.frombytes("RGB", (shot.width, shot.height), shot.rgb)
+
+                img_bytes  = self._to_bytes(img)
+                img_base64 = base64.b64encode(img_bytes).decode()
+
+                logger.info(f"Full-screen shot: {shot.width}×{shot.height}")
                 return img_bytes, img_base64
-                
+
         except Exception as e:
-            logger.error(f"Failed to capture screenshot: {e}")
+            logger.error(f"capture_full_screen failed: {e}")
             raise
-    
+
+    # ── Hotkey handler ────────────────────────────────────────────────────────
+
     def _on_hotkey_pressed(self):
-        """
-        Internal callback when hotkey is pressed.
-        Captures screenshot and triggers the overlay.
-        """
-        logger.info("Hotkey triggered: Win+Shift+E")
-        
+        logger.info("⚡ Transmutation Circle Activated! (Win+Shift+E)")
         try:
-            # Capture screenshot
-            img_bytes, img_base64 = self.capture_screenshot()
-            
-            # Call the user-provided callback with screenshot data
+            # Save the foreground window NOW, before the overlay takes focus
+            self._target_hwnd = ctypes.windll.user32.GetForegroundWindow()
+            img_bytes, img_base64 = self.capture_for_mode()
             if self.on_trigger_callback:
                 self.on_trigger_callback(img_bytes, img_base64)
             else:
                 logger.warning("No trigger callback registered")
-                
         except Exception as e:
             logger.error(f"Error in hotkey handler: {e}")
-    
+
+    # ── Lifecycle ─────────────────────────────────────────────────────────────
+
     def start(self):
-        """
-        Start listening for the global hotkey.
-        Non-blocking - runs in background thread.
-        """
         if not HOTKEY_ENABLED:
-            logger.info("Hotkey is disabled in configuration")
+            logger.info("Hotkey disabled in config")
             return
-        
         if self.is_running:
-            logger.warning("Agent is already running")
+            logger.warning("Agent already running")
             return
-        
         try:
-            # Create hotkey listener
-            # Win+Shift+E = <cmd>+<shift>+e on Windows
-            self.listener = keyboard.GlobalHotKeys({
-                '<cmd>+<shift>+e': self._on_hotkey_pressed
-            })
-            
-            # Start listening in background thread
+            self.listener = keyboard.GlobalHotKeys(
+                {'<cmd>+<shift>+e': self._on_hotkey_pressed}
+            )
             self.listener.start()
             self.is_running = True
-            
-            logger.info("Edward Agent started - listening for Win+Shift+E")
-            
+            logger.info("Edward Agent started — listening for Win+Shift+E")
         except Exception as e:
             logger.error(f"Failed to start agent: {e}")
             raise
-    
+
     def stop(self):
-        """
-        Stop listening for the global hotkey.
-        """
         if not self.is_running:
             return
-        
         try:
             if self.listener:
                 self.listener.stop()
                 self.listener = None
-            
             self.is_running = False
             logger.info("Edward Agent stopped")
-            
         except Exception as e:
             logger.error(f"Error stopping agent: {e}")
-    
+
     def __enter__(self):
-        """Context manager entry"""
         self.start()
         return self
-    
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        """Context manager exit"""
+
+    def __exit__(self, *_):
         self.stop()
 
+    # ── Helpers ───────────────────────────────────────────────────────────────
 
-# Example usage
-if __name__ == "__main__":
-    def test_callback(img_bytes: bytes, img_base64: str):
-        """Test callback function"""
-        print(f"Screenshot captured! Size: {len(img_bytes)} bytes")
-        print(f"Base64 length: {len(img_base64)} characters")
-    
-    # Create and start agent
-    agent = EdwardAgent(on_trigger_callback=test_callback)
-    
-    try:
-        agent.start()
-        print("Agent running. Press Win+Shift+E to test. Press Ctrl+C to exit.")
-        
-        # Keep running until interrupted
-        import time
-        while True:
-            time.sleep(1)
-            
-    except KeyboardInterrupt:
-        print("\nStopping agent...")
-        agent.stop()
-
-# Made with Bob
+    @staticmethod
+    def _to_bytes(img: Image.Image) -> bytes:
+        buf = io.BytesIO()
+        img.save(buf, format='PNG', optimize=True)
+        return buf.getvalue()

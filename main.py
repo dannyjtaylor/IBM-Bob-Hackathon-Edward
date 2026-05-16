@@ -3,14 +3,20 @@ Edward - Local Windows Desktop AI Assistant
 Main entry point that coordinates all components
 """
 
+import os
+import signal
 import sys
 import warnings
-import os
 
 # Suppress NumPy and other startup warnings
-warnings.filterwarnings('ignore', category=UserWarning)
-warnings.filterwarnings('ignore', category=DeprecationWarning)
+warnings.filterwarnings('ignore')
 os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = '1'
+os.environ['PYTHONWARNINGS'] = 'ignore'
+
+# Suppress NumPy 2.x compatibility warnings
+import numpy as np
+if hasattr(np, '__version__') and np.__version__.startswith('1.'):
+    pass  # NumPy 1.x is fine
 
 from pathlib import Path
 from typing import Optional
@@ -25,11 +31,13 @@ from overlay import EdwardOverlay
 from tts import get_tts
 from widgets.acting_indicator import ActingIndicator
 from stt import get_stt
-from api_client import get_api_client
+from gemma_client import get_gemma_client
 from context_enhancer import get_context_enhancer
 from ui import PasswordUnlockDialog, PasswordManagerDialog, SettingsDialog, ConfirmationDialog
 from computer_actions import create_file, edit_file, open_file_or_app
-from config import USER_NAME, COLORS
+from local_commands import process as local_process
+from wake_word import WakeWordDetector
+from config import USER_NAME, COLORS, WAKE_WORD_ENABLED
 from logger import setup_logger
 
 # Setup colored logging
@@ -46,6 +54,18 @@ class SpeechSignalBridge(QObject):
     speech_result = pyqtSignal(object)  # Will emit Optional[str]
 
 
+class TraySignalBridge(QObject):
+    """Bridge to safely open dialogs from pystray's background thread"""
+    open_vault    = pyqtSignal()
+    open_settings = pyqtSignal()
+    show_overlay  = pyqtSignal()
+
+
+class WakeSignalBridge(QObject):
+    """Bridge to safely trigger overlay from the wake-word background thread"""
+    detected = pyqtSignal(str)   # payload: text command (may be empty string)
+
+
 class Edward:
     """
     Main Edward application class.
@@ -54,7 +74,11 @@ class Edward:
     
     def __init__(self):
         """Initialize Edward application"""
-        logger.info("Initializing Edward...")
+        logger.info("=" * 60)
+        logger.info("⚡ EDWARD ELRIC - FULLMETAL ALCHEMIST ⚡")
+        logger.info("Equivalent Exchange: To obtain, something of equal value must be lost")
+        logger.info("=" * 60)
+        logger.info("Initializing Edward's Automail systems...")
         
         # Create Qt application
         self.app = QApplication(sys.argv)
@@ -73,6 +97,8 @@ class Edward:
         # Create signal bridges for thread-safe communication
         self.hotkey_bridge = HotkeySignalBridge()
         self.speech_bridge = SpeechSignalBridge()
+        self.tray_bridge   = TraySignalBridge()
+        self.wake_bridge   = WakeSignalBridge()
         
         # Initialize components
         self.overlay = EdwardOverlay()
@@ -80,19 +106,37 @@ class Edward:
         self.agent = EdwardAgent(on_trigger_callback=self._on_hotkey_triggered)
         self.tts = get_tts()
         self.stt = get_stt()
-        self.api_client = get_api_client()
+        self.gemma_client = get_gemma_client()
         self.context_enhancer = get_context_enhancer()
         
+        # Give overlay a capture callable so it can refresh the thumbnail periodically
+        self.overlay._refresh_capture_fn = self.agent.capture_for_mode
+
         # Connect signals
         self.overlay.question_submitted.connect(self._on_question_submitted)
         self.hotkey_bridge.triggered.connect(self._show_overlay_safe)
         self.overlay.mic_button.clicked.connect(self._on_mic_button_clicked)
         self.speech_bridge.speech_result.connect(self._on_speech_result_safe)
-        
+        self.overlay.screenshot_mode_changed.connect(self._on_screenshot_mode_changed)
+        self.overlay.backend_changed.connect(self._on_backend_changed)
+        self.tray_bridge.open_vault.connect(self._show_password_vault_safe)
+        self.tray_bridge.open_settings.connect(self._show_settings_safe)
+        self.tray_bridge.show_overlay.connect(self._show_overlay_from_tray)
+        self.wake_bridge.detected.connect(self._on_wake_detected_safe)
+
+        # Wake word detector — suppress while overlay is visible
+        self.wake_detector = WakeWordDetector(
+            on_wake_callback=self._on_wake_word_raw,
+        )
+        self.overlay.visibility_changed.connect(self._on_overlay_visibility)
+
         # System tray icon
         self.tray_icon = None
         
-        logger.info("Edward initialized successfully")
+        logger.info("✓ Automail calibration complete")
+        logger.info("✓ Alchemy circle activated")
+        logger.info("Edward is ready for transmutation!")
+        logger.info("=" * 60)
     
     def _on_hotkey_triggered(self, img_bytes: bytes, img_base64: str):
         """
@@ -144,30 +188,54 @@ class Edward:
         # Re-enable buttons
         self.overlay.enable_input()
     
+    @Slot(object)
+    def _on_screenshot_mode_changed(self, mode):
+        """Update agent mode and re-capture so the thumbnail refreshes immediately."""
+        self.agent.screenshot_mode = mode
+        self.overlay.set_status(f"Switched to {mode.value} mode — capturing…")
+        try:
+            img_bytes, img_base64 = self.agent.capture_for_mode(mode)
+            self.overlay.update_screenshot(img_bytes, img_base64)
+            self.overlay.set_status("")
+        except Exception as e:
+            logger.error(f"Re-capture failed after mode change: {e}")
+            self.overlay.set_status(f"Capture failed: {e}", error=True)
+
+    @Slot(str)
+    def _on_backend_changed(self, name: str):
+        """Hot-swap the AI backend."""
+        self.gemma_client.set_backend(name)
+        logger.info(f"Backend switched to {name}")
+
     def _on_question_submitted(self, question: str):
-        """
-        Called when user submits a question.
-        Sends to IBM Bob API and handles response.
-        """
+        """Called when user submits a question to Gemma 4."""
         logger.info(f"Processing question: {question[:50]}...")
-        
+
         # Get screenshot data if available
         screenshot_base64 = None
         if self.overlay.screenshot_data:
             _, screenshot_base64 = self.overlay.screenshot_data
             logger.info("Including screenshot with question")
-        
+
+        # Fast path: local commands need no Ollama
+        local_response = local_process(question, screenshot_base64)
+        if local_response is not None:
+            if local_response == "__OPEN_VAULT__":
+                self.overlay.hide_overlay()
+                self.tray_bridge.open_vault.emit()
+            else:
+                self.overlay.set_response(local_response)
+                if self.tts.is_enabled and local_response:
+                    self.tts.speak_async(local_response, stream_audio=True)
+            self.overlay.enable_input()
+            logger.info("Local command handled — skipping Gemma")
+            return
+
         # Call API asynchronously
         asyncio.create_task(self._process_question_async(question, screenshot_base64))
     
     async def _process_question_async(self, question: str, screenshot_base64: Optional[str]):
-        """
-        Process question with IBM Bob API asynchronously.
-        
-        Args:
-            question: User's question
-            screenshot_base64: Base64-encoded screenshot (optional)
-        """
+        """Process question with Gemma 4 asynchronously."""
         self.acting_indicator.show_acting()
         try:
             # Clear previous response
@@ -188,10 +256,10 @@ class Edward:
             if context_metadata.get('screenshot_included'):
                 logger.info("Screenshot context included")
             
-            # Try to connect to Bob API
+            # Ask Gemma 4 (Edward's alchemy!)
             full_response = ""
             try:
-                async for chunk in self.api_client.ask_question(
+                async for chunk in self.gemma_client.ask_question(
                     question=enhanced_prompt,  # Use enhanced prompt instead of raw question
                     screenshot_base64=screenshot_base64,
                     stream=True
@@ -199,11 +267,11 @@ class Edward:
                     full_response += chunk
                     self.overlay.append_response(chunk)
                 
-                logger.info(f"Received response from Bob API: {full_response[:100]}...")
+                logger.info(f"⚡ Transmutation complete: {full_response[:100]}...")
                 
             except Exception as api_error:
-                # Fallback response when Bob API is not available
-                logger.warning(f"Bob API unavailable: {api_error}. Using fallback response.")
+                # Fallback response when Gemma 4 is not available
+                logger.warning(f"⚠️ Gemma 4 unavailable: {api_error}. Using fallback response.")
                 
                 fallback_response = self._generate_fallback_response(question, screenshot_base64)
                 full_response = fallback_response
@@ -226,7 +294,7 @@ class Edward:
     
     def _generate_fallback_response(self, question: str, screenshot_base64: Optional[str]) -> str:
         """
-        Generate a fallback response when Bob API is unavailable.
+        Generate a fallback response when Gemma 4 is unavailable.
         
         Args:
             question: User's question
@@ -239,67 +307,120 @@ class Edward:
         
         # Check for common patterns
         if any(word in question_lower for word in ['hello', 'hi', 'hey']):
-            return f"Hello, {USER_NAME}! I'm Edward, your AI assistant. The Bob API server is currently offline, but I'm here to help with basic responses. To enable full functionality, please start the Bob API server."
+            return f"Hello, {USER_NAME}! I'm Edward, the FullCUDA Alchemist! Ollama with Gemma 4 seems to be offline. Make sure Ollama is running to enable my full alchemy powers!"
         
         elif any(word in question_lower for word in ['screen', 'see', 'what', 'show']):
             if screenshot_base64:
-                return f"I can see your screen, {USER_NAME}, but I need the Bob API server to analyze it properly. The server appears to be offline. Please start it to enable vision capabilities."
+                return f"I can see the area around your cursor, {USER_NAME}, but I need Ollama with Gemma 4 running to analyze it with alchemy. Please start Ollama!"
             else:
-                return "I don't have a screenshot to analyze. Try pressing Win+Shift+E to capture your screen first."
+                return "I don't have a screenshot to analyze. Try pressing Win+Shift+E to capture the area around your cursor first."
         
         elif any(word in question_lower for word in ['move', 'click', 'type', 'open', 'close']):
-            return f"I understand you want me to perform an action, {USER_NAME}. However, I need the Bob API server running to execute autonomous actions. Please start the server at http://localhost:6700."
+            return f"I understand you want me to perform an action, {USER_NAME}. However, I need Ollama with Gemma 4 running to execute autonomous actions. Start Ollama at http://localhost:11434."
         
         elif 'help' in question_lower:
-            return f"""I'm Edward, your AI assistant. Currently running in fallback mode because the Bob API server is offline.
+            return f"""I'm Edward, the FullCUDA Alchemist! Currently in fallback mode because Ollama is offline.
 
-To enable full functionality:
-1. Start the Bob API server (should run on http://localhost:6700)
-2. Make sure the server is configured in your .env file
+To enable full alchemy (AI) functionality:
+1. Make sure Ollama is running (http://localhost:11434)
+2. Verify Gemma 4 model is installed: ollama list
+3. Pull if needed: ollama pull gemma4:latest
 
 In the meantime, I can provide basic responses. How can I assist you, {USER_NAME}?"""
         
         else:
-            return f"I received your question: '{question}'. However, the Bob API server is currently offline, so I can't provide a detailed response. Please start the Bob API server to enable full AI capabilities, {USER_NAME}."
+            return f"I received your question: '{question}'. However, Ollama is currently offline. Make sure Ollama is running and Gemma 4 is pulled (`ollama pull gemma4:latest`), {USER_NAME}."
     
     def _create_tray_icon(self):
-        """Create system tray icon"""
-        # Create a simple icon
-        width = 64
-        height = 64
-        color1 = COLORS['gold']
-        color2 = COLORS['red']
-        
-        image = Image.new('RGB', (width, height), color1)
-        dc = ImageDraw.Draw(image)
-        dc.rectangle(
-            (width // 4, height // 4, width * 3 // 4, height * 3 // 4),
-            fill=color2
-        )
-        
-        # Create menu
+        """Create system tray icon — FMA transmutation circle"""
+        image = self._draw_alchemy_circle(64)
+
         menu = pystray.Menu(
-            pystray.MenuItem('Show Edward', self._show_overlay),
+            pystray.MenuItem('Show Edward',    self._show_overlay),
             pystray.MenuItem('Password Vault', self._show_password_vault),
-            pystray.MenuItem('Settings', self._show_settings),
+            pystray.MenuItem('Settings',       self._show_settings),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem('Exit', self._quit_app)
         )
-        
-        # Create icon
+
         self.tray_icon = pystray.Icon(
-            "Edward",
-            image,
-            "Edward - AI Assistant",
-            menu
+            "Edward", image, "Edward — FullCUDA Alchemist", menu
         )
+
+    @staticmethod
+    def _draw_alchemy_circle(size: int = 64) -> Image.Image:
+        import math
+        img  = Image.new('RGBA', (size, size), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+
+        gold  = (218, 165, 32, 255)
+        dark  = (13,  13,  13, 255)
+
+        cx = cy = size / 2
+        ro = size / 2 - 2          # outer ring
+        ri = ro * 0.72             # inner ring
+        rh = ro * 0.62             # hexagram points
+        rc = ro * 0.18             # center dot
+        lw = max(1, size // 32)    # line width
+
+        # Dark background disk
+        draw.ellipse([2, 2, size - 2, size - 2], fill=dark)
+
+        # Outer ring
+        draw.ellipse([2, 2, size - 2, size - 2], outline=gold, width=lw)
+
+        # Inner ring
+        m = size // 2 - int(ri)
+        draw.ellipse([m, m, size - m, size - m], outline=gold, width=lw)
+
+        # Center circle
+        mc = int(cx - rc), int(cy - rc), int(cx + rc), int(cy + rc)
+        draw.ellipse(mc, outline=gold, width=lw)
+
+        # Helper: point on circle
+        def pt(deg, r):
+            a = math.radians(deg - 90)
+            return cx + r * math.cos(a), cy + r * math.sin(a)
+
+        # Hexagram: two overlapping triangles
+        for angles in [(0, 120, 240), (60, 180, 300)]:
+            tri = [pt(a, rh) for a in angles]
+            draw.polygon(tri, outline=gold, fill=None, width=lw)
+
+        # Node dots at hexagram vertices
+        rn = max(2, size // 22)
+        for angle in range(0, 360, 60):
+            px, py = pt(angle, rh)
+            draw.ellipse([px - rn, py - rn, px + rn, py + rn], fill=gold)
+
+        # Tick marks (12, like a clock)
+        for i in range(12):
+            a = math.radians(i * 30 - 90)
+            x1, y1 = cx + (ro - 1) * math.cos(a), cy + (ro - 1) * math.sin(a)
+            x2, y2 = cx + (ro - 4) * math.cos(a), cy + (ro - 4) * math.sin(a)
+            draw.line([x1, y1, x2, y2], fill=gold, width=lw)
+
+        return img
     
+    # ── Tray callbacks (run on pystray's background thread → emit signals) ────
+
     def _show_overlay(self):
-        """Show overlay from tray menu"""
-        self.overlay.show_overlay()
-    
+        self.tray_bridge.show_overlay.emit()
+
     def _show_password_vault(self):
-        """Open password vault — prompt for master password then show manager."""
+        self.tray_bridge.open_vault.emit()
+
+    def _show_settings(self):
+        self.tray_bridge.open_settings.emit()
+
+    # ── Thread-safe slots (run on Qt main thread) ─────────────────────────────
+
+    @Slot()
+    def _show_overlay_from_tray(self):
+        self.overlay.show_overlay()
+
+    @Slot()
+    def _show_password_vault_safe(self):
         unlock = PasswordUnlockDialog()
         if unlock.exec() != PasswordUnlockDialog.DialogCode.Accepted:
             return
@@ -307,8 +428,44 @@ In the meantime, I can provide basic responses. How can I assist you, {USER_NAME
         if vault:
             PasswordManagerDialog(vault).exec()
 
-    def _show_settings(self):
+    @Slot()
+    def _show_settings_safe(self):
         SettingsDialog().exec()
+
+    # ── Wake word ─────────────────────────────────────────────────────────────
+
+    def _on_wake_word_raw(self, command: Optional[str]):
+        """Called from wake-word thread — emit signal to main thread."""
+        self.wake_bridge.detected.emit(command or "")
+
+    @Slot(bool)
+    def _on_overlay_visibility(self, visible: bool):
+        if visible:
+            self.wake_detector.suppress()
+        else:
+            self.wake_detector.resume()
+
+    @Slot(str)
+    def _on_wake_detected_safe(self, command: str):
+        """Wake word fired — show overlay, optionally auto-submit command."""
+        logger.info(f"Wake word → main thread, command={command!r}")
+        try:
+            img_bytes, img_base64 = self.agent.capture_for_mode()
+        except Exception:
+            img_bytes, img_base64 = b"", ""
+
+        self.overlay.show_overlay(
+            screenshot_data=(img_bytes, img_base64) if img_bytes else None
+        )
+
+        if command:
+            # Full utterance: "Hey Edward, open notepad" → auto-submit
+            self.overlay.input_field.setPlainText(command)
+            self._on_question_submitted(command)
+        else:
+            # Just the wake word — start listening for the command
+            self.overlay.set_status("Listening… speak your command ⚡")
+            self._on_mic_button_clicked()
 
     def _request_action_confirmation(self, action_request):
         """
@@ -429,17 +586,13 @@ In the meantime, I can provide basic responses. How can I assist you, {USER_NAME
     def _quit_app(self):
         """Quit the application"""
         logger.info("Shutting down Edward...")
-        
-        # Stop components
         self.agent.stop()
+        self.wake_detector.stop()
         self.tts.cleanup()
-        
-        # Stop tray icon
         if self.tray_icon:
             self.tray_icon.stop()
-        
-        # Quit Qt application
         self.app.quit()
+        self.loop.stop()
     
     def run(self):
         """Start Edward application"""
@@ -447,6 +600,9 @@ In the meantime, I can provide basic responses. How can I assist you, {USER_NAME
         
         # Start agent (hotkey listener)
         self.agent.start()
+
+        # Start wake word detector
+        self.wake_detector.start()
         
         # Create and run system tray icon
         self._create_tray_icon()
@@ -457,10 +613,27 @@ In the meantime, I can provide basic responses. How can I assist you, {USER_NAME
         tray_thread.start()
         
         logger.info(f"Edward is running. Press Win+Shift+E to activate, {USER_NAME}.")
-        
-        # Run Qt event loop with asyncio support
+
+        # Allow Ctrl+C to work inside Qt's event loop.
+        # Qt's C loop can starve Python signal handling, so we ping Python
+        # every 500 ms via a no-op timer to keep the GIL alive.
+        from PySide6.QtCore import QTimer as _QTimer
+        _sigint_timer = _QTimer()
+        _sigint_timer.setInterval(500)
+        _sigint_timer.timeout.connect(lambda: None)
+        _sigint_timer.start()
+
+        def _handle_sigint(*_):
+            logger.info("Ctrl+C — shutting down Edward…")
+            self._quit_app()
+
+        signal.signal(signal.SIGINT, _handle_sigint)
+
         with self.loop:
-            sys.exit(self.loop.run_forever())
+            try:
+                self.loop.run_forever()
+            except (KeyboardInterrupt, SystemExit):
+                self._quit_app()
 
 
 def main():
@@ -468,14 +641,14 @@ def main():
     try:
         edward = Edward()
         edward.run()
-    except KeyboardInterrupt:
-        logger.info("Interrupted by user")
+    except (KeyboardInterrupt, SystemExit):
+        pass
     except Exception as e:
         logger.error(f"Fatal error: {e}", exc_info=True)
-        sys.exit(1)
+    finally:
+        os._exit(0)   # force-kill any lingering daemon threads
 
 
 if __name__ == "__main__":
     main()
 
-# Made with Bob

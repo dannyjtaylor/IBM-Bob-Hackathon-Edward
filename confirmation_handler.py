@@ -68,15 +68,15 @@ class ActionRequest:
 class ConfirmationHandler:
     """
     Handles confirmation flow for computer actions.
-    Parses Bob's responses, presents confirmation dialogs, and executes approved actions.
+    Parses Edward's responses, presents confirmation dialogs, and executes approved actions.
     """
-    
+
     def __init__(self):
         """Initialize the confirmation handler"""
         self.pending_action: Optional[ActionRequest] = None
         self.confirmation_callback: Optional[Callable] = None
-        
-        # Patterns to detect action requests in Bob's responses
+
+        # Patterns to detect action requests in Edward's responses
         self.action_patterns = {
             ActionType.CREATE_FILE: [
                 r"(?:create|make|write)\s+(?:a\s+)?(?:new\s+)?file\s+(?:called\s+|named\s+)?['\"]?([^'\"]+)['\"]?",
@@ -98,10 +98,10 @@ class ConfirmationHandler:
     
     def parse_response_for_actions(self, response: str) -> Optional[ActionRequest]:
         """
-        Parse Bob's response to detect action requests.
-        
+        Parse Edward's response to detect action requests.
+
         Args:
-            response: Bob's response text
+            response: Response text
             
         Returns:
             ActionRequest if action detected, None otherwise

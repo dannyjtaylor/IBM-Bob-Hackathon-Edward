@@ -1,7 +1,7 @@
 """
 Edward Context Enhancer
-Combines multiple context sources (screenshot, clipboard, history) 
-to create rich prompts for IBM Bob
+Combines multiple context sources (screenshot, clipboard, history)
+to create rich prompts for Gemma 4.
 """
 
 from typing import Optional, Dict, Any
@@ -14,7 +14,7 @@ logger = get_logger(__name__)
 class ContextEnhancer:
     """
     Enhances user questions with contextual information
-    to help IBM Bob provide better responses.
+    to help Gemma 4 provide better responses.
     """
     
     def __init__(self):
