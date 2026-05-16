@@ -15,6 +15,49 @@ from logger import get_logger
 logger = get_logger(__name__)
 
 
+def _clean_text_for_speech(text: str) -> str:
+    """
+    Clean text for speech by removing code blocks, URLs, and other non-speakable content.
+    
+    Args:
+        text: Raw text from AI response
+        
+    Returns:
+        Cleaned text suitable for TTS
+    """
+    import re
+    
+    # Remove code blocks (```...```)
+    text = re.sub(r'```[\s\S]*?```', '[code block omitted]', text)
+    
+    # Remove inline code (`...`)
+    text = re.sub(r'`[^`]+`', '[code omitted]', text)
+    
+    # Remove URLs
+    text = re.sub(r'https?://[^\s]+', '[link omitted]', text)
+    
+    # Remove file paths (C:\..., /usr/..., etc.)
+    text = re.sub(r'[A-Za-z]:\\[^\s]+', '[file path omitted]', text)
+    text = re.sub(r'/[a-z]+/[^\s]+', '[file path omitted]', text)
+    
+    # Remove markdown headers (##, ###, etc.)
+    text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
+    
+    # Remove markdown bold/italic (**text**, *text*)
+    text = re.sub(r'\*\*([^*]+)\*\*', r'\1', text)
+    text = re.sub(r'\*([^*]+)\*', r'\1', text)
+    
+    # Remove markdown lists (-, *, 1., etc.)
+    text = re.sub(r'^\s*[-*]\s+', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^\s*\d+\.\s+', '', text, flags=re.MULTILINE)
+    
+    # Clean up multiple spaces and newlines
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    text = re.sub(r' {2,}', ' ', text)
+    
+    return text.strip()
+
+
 class EdwardTTS:
     """
     Text-to-Speech engine using ElevenLabs API.
@@ -48,13 +91,14 @@ class EdwardTTS:
         
         logger.info(f"Edward TTS initialized (enabled: {self.is_enabled})")
     
-    def speak(self, text: str, stream_audio: bool = True) -> bool:
+    def speak(self, text: str, stream_audio: bool = True, clean_text: bool = True) -> bool:
         """
         Convert text to speech and play it.
         
         Args:
             text: Text to speak
             stream_audio: If True, stream audio for faster playback
+            clean_text: If True, remove code blocks and URLs before speaking
             
         Returns:
             True if successful, False otherwise
@@ -69,6 +113,14 @@ class EdwardTTS:
         
         try:
             self.is_speaking = True
+            
+            # Clean text for speech if requested
+            if clean_text:
+                original_length = len(text)
+                text = _clean_text_for_speech(text)
+                if len(text) < original_length:
+                    logger.info(f"Cleaned text for speech (removed {original_length - len(text)} chars)")
+            
             logger.info(f"Speaking: {text[:50]}...")
             
             if stream_audio:
@@ -155,18 +207,19 @@ class EdwardTTS:
             logger.error(f"Complete TTS error: {e}")
             raise
     
-    def speak_async(self, text: str, stream_audio: bool = True):
+    def speak_async(self, text: str, stream_audio: bool = True, clean_text: bool = True):
         """
         Speak text asynchronously (non-blocking).
         
         Args:
             text: Text to speak
             stream_audio: If True, stream audio for faster playback
+            clean_text: If True, remove code blocks and URLs before speaking
         """
         import threading
         
         def _speak_thread():
-            self.speak(text, stream_audio)
+            self.speak(text, stream_audio, clean_text)
         
         thread = threading.Thread(target=_speak_thread, daemon=True)
         thread.start()
