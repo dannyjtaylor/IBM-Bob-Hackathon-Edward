@@ -307,6 +307,122 @@ In the meantime, I can provide basic responses. How can I assist you, {USER_NAME
             PasswordManagerDialog(vault).exec()
 
     def _show_settings(self):
+    
+    def _request_action_confirmation(self, action_request):
+        """
+        Request user confirmation for a computer action.
+        
+        Args:
+            action_request: ActionRequest object from confirmation_handler
+        """
+        logger.info(f"Requesting confirmation for: {action_request.description}")
+        
+        # Create confirmation dialog
+        self.confirmation_dialog = ConfirmationDialog()
+        self.confirmation_dialog.set_action(
+            action_request.description,
+            action_request.parameters
+        )
+        
+        # Connect signals
+        self.confirmation_dialog.confirmed.connect(
+            lambda: self._on_action_confirmed(action_request)
+        )
+        self.confirmation_dialog.denied.connect(
+            lambda: self._on_action_denied(action_request)
+        )
+        
+        # Show dialog
+        self.confirmation_dialog.exec()
+    
+    def _on_action_confirmed(self, action_request):
+        """
+        Handle user confirming an action.
+        
+        Args:
+            action_request: ActionRequest object
+        """
+        logger.info(f"Action confirmed: {action_request.description}")
+        
+        # Execute the action
+        result = self._execute_action(action_request)
+        
+        # Display result to user
+        if result.get('success'):
+            message = f"✓ {result['message']}"
+            logger.info(f"Action succeeded: {message}")
+        else:
+            message = f"✗ {result['message']}"
+            logger.error(f"Action failed: {message}")
+        
+        # Append result to overlay
+        self.overlay.append_response(f"\n\n{message}")
+        
+        # Speak result if TTS enabled
+        if self.tts.is_enabled:
+            self.tts.speak_async(message, stream_audio=True)
+    
+    def _on_action_denied(self, action_request):
+        """
+        Handle user denying an action.
+        
+        Args:
+            action_request: ActionRequest object
+        """
+        logger.info(f"Action denied: {action_request.description}")
+        
+        message = "Action cancelled by user."
+        self.overlay.append_response(f"\n\n{message}")
+        
+        if self.tts.is_enabled:
+            self.tts.speak_async(message, stream_audio=True)
+    
+    def _execute_action(self, action_request) -> dict:
+        """
+        Execute a confirmed computer action.
+        
+        Args:
+            action_request: ActionRequest object
+            
+        Returns:
+            Result dictionary with success status and message
+        """
+        from confirmation_handler import ActionType
+        
+        action_type = action_request.action_type
+        params = action_request.parameters
+        
+        try:
+            if action_type == ActionType.CREATE_FILE:
+                return create_file(
+                    params.get('file_path', ''),
+                    params.get('content', ''),
+                    overwrite=False
+                )
+            
+            elif action_type == ActionType.EDIT_FILE:
+                return edit_file(
+                    params.get('file_path', ''),
+                    params.get('new_content', '')
+                )
+            
+            elif action_type == ActionType.OPEN_FILE or action_type == ActionType.OPEN_APP:
+                return open_file_or_app(params.get('path', ''))
+            
+            else:
+                return {
+                    'success': False,
+                    'message': f"Unknown action type: {action_type}",
+                    'error': 'unknown_action'
+                }
+        
+        except Exception as e:
+            logger.error(f"Error executing action: {e}", exc_info=True)
+            return {
+                'success': False,
+                'message': f"Error executing action: {str(e)}",
+                'error': 'execution_error'
+            }
         SettingsDialog().exec()
     
     def _quit_app(self):
