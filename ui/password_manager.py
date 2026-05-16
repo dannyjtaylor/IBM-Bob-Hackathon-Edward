@@ -9,7 +9,7 @@ from PySide6.QtWidgets import (
     QHeaderView, QAbstractItemView, QMessageBox, QCheckBox, QFormLayout,
     QWidget
 )
-from PySide6.QtCore import Qt, QSortFilterProxyModel
+from PySide6.QtCore import Qt, QTimer, QEvent
 from PySide6.QtGui import QFont, QGuiApplication
 
 from vault import PasswordVault
@@ -206,12 +206,17 @@ class PasswordManagerDialog(QDialog):
     Requires an already-unlocked PasswordVault instance.
     """
 
+    _AUTO_LOCK_MS = 5 * 60 * 1000  # 5 minutes
+
     def __init__(self, vault: PasswordVault, parent=None):
         super().__init__(parent)
         self._vault = vault
+        self._remaining_secs = self._AUTO_LOCK_MS // 1000
         self._setup_window()
         self._setup_ui()
+        self._setup_lock_timer()
         self._load_entries()
+        self.installEventFilter(self)
 
     # ── Window ────────────────────────────────────────────────────────────────
 
@@ -286,10 +291,16 @@ class PasswordManagerDialog(QDialog):
         """)
         layout.addWidget(self._table, stretch=1)
 
-        # Double-click hint
+        # Status bar: hint left, auto-lock countdown right
+        status_row = QHBoxLayout()
         hint = QLabel("Double-click a row to copy the password to clipboard")
         hint.setStyleSheet(f"color: {COLORS['silver']}; font-size: 11px;")
-        layout.addWidget(hint)
+        status_row.addWidget(hint)
+        status_row.addStretch()
+        self._lock_label = QLabel("Auto-lock in 5:00")
+        self._lock_label.setStyleSheet(f"color: {COLORS['silver']}; font-size: 11px;")
+        status_row.addWidget(self._lock_label)
+        layout.addLayout(status_row)
 
         # Button bar
         btn_row = QHBoxLayout()
@@ -336,6 +347,47 @@ class PasswordManagerDialog(QDialog):
         btn_row.addWidget(close_btn)
 
         layout.addLayout(btn_row)
+
+    # ── Auto-lock ─────────────────────────────────────────────────────────────
+
+    def _setup_lock_timer(self):
+        self._lock_timer = QTimer(self)
+        self._lock_timer.setSingleShot(True)
+        self._lock_timer.timeout.connect(self._auto_lock)
+        self._lock_timer.start(self._AUTO_LOCK_MS)
+
+        self._countdown_timer = QTimer(self)
+        self._countdown_timer.timeout.connect(self._tick_countdown)
+        self._countdown_timer.start(1000)
+
+    def _tick_countdown(self):
+        self._remaining_secs = max(0, self._remaining_secs - 1)
+        m, s = divmod(self._remaining_secs, 60)
+        text = f"Auto-lock in {m}:{s:02d}"
+        color = COLORS['red'] if self._remaining_secs < 60 else COLORS['silver']
+        self._lock_label.setText(text)
+        self._lock_label.setStyleSheet(f"color: {color}; font-size: 11px;")
+
+    def _reset_lock_timer(self):
+        self._remaining_secs = self._AUTO_LOCK_MS // 1000
+        self._lock_timer.start(self._AUTO_LOCK_MS)
+
+    def _auto_lock(self):
+        self._countdown_timer.stop()
+        self._table.setRowCount(0)
+        logger.info("Password vault auto-locked due to inactivity")
+        QMessageBox.information(self, "Vault Locked",
+            "Password vault locked after 5 minutes of inactivity.")
+        self.reject()
+
+    def eventFilter(self, obj, event):
+        if event.type() in (
+            QEvent.Type.MouseButtonPress,
+            QEvent.Type.KeyPress,
+            QEvent.Type.Wheel,
+        ):
+            self._reset_lock_timer()
+        return super().eventFilter(obj, event)
 
     # ── Data ──────────────────────────────────────────────────────────────────
 

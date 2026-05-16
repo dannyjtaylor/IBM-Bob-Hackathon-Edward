@@ -2,6 +2,7 @@
 
 import os
 import sys
+import threading
 from pathlib import Path
 
 from PySide6.QtWidgets import (
@@ -9,7 +10,7 @@ from PySide6.QtWidgets import (
     QTabWidget, QWidget, QLabel, QLineEdit, QPushButton,
     QCheckBox, QSlider, QComboBox, QMessageBox
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QObject, Signal
 from PySide6.QtGui import QFont
 
 from dotenv import set_key, load_dotenv
@@ -236,8 +237,53 @@ class SettingsDialog(QDialog):
         form.setSpacing(12)
         form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
 
-        self._voice_id = _field("ElevenLabs voice ID")
-        form.addRow(_lbl("Voice ID"), self._voice_id)
+        # Voice picker row: combo + Refresh + Preview
+        voice_row = QHBoxLayout()
+        voice_row.setSpacing(6)
+
+        self._voice_combo = QComboBox()
+        self._voice_combo.setFont(QFont("Segoe UI", 11))
+        self._voice_combo.addItem("Loading voices…", "")
+        self._voice_combo.setEnabled(False)
+        self._voice_combo.setStyleSheet(f"""
+            QComboBox {{
+                background-color: {COLORS['background']}; color: {COLORS['text']};
+                border: 2px solid {COLORS['silver']}; border-radius: 5px; padding: 5px 10px;
+            }}
+            QComboBox::drop-down {{ border: none; }}
+            QComboBox QAbstractItemView {{
+                background-color: {COLORS['panel']}; color: {COLORS['text']};
+                selection-background-color: {COLORS['gold']};
+                selection-color: {COLORS['background']};
+            }}
+        """)
+        voice_row.addWidget(self._voice_combo, stretch=1)
+
+        refresh_btn = QPushButton("↻")
+        refresh_btn.setFixedWidth(34)
+        refresh_btn.setFont(QFont("Segoe UI", 13))
+        refresh_btn.setToolTip("Refresh voice list")
+        refresh_btn.setStyleSheet(f"""
+            QPushButton {{ background: {COLORS['background']}; color: {COLORS['silver']};
+                border: 1px solid {COLORS['silver']}; border-radius: 5px; }}
+            QPushButton:hover {{ background: #2A2A2A; }}
+        """)
+        refresh_btn.clicked.connect(self._fetch_voices)
+        voice_row.addWidget(refresh_btn)
+
+        self._preview_btn = QPushButton("Preview")
+        self._preview_btn.setFont(QFont("Segoe UI", 10))
+        self._preview_btn.setEnabled(False)
+        self._preview_btn.setStyleSheet(f"""
+            QPushButton {{ background: {COLORS['gold']}; color: {COLORS['background']};
+                border: none; border-radius: 5px; padding: 5px 10px; font-weight: bold; }}
+            QPushButton:hover {{ background: #E5B52E; }}
+            QPushButton:disabled {{ background: #444; color: #777; }}
+        """)
+        self._preview_btn.clicked.connect(self._preview_voice)
+        voice_row.addWidget(self._preview_btn)
+
+        form.addRow(_lbl("ElevenLabs voice"), voice_row)
 
         self._stt_model = _combo(["tiny", "base", "small", "medium", "large"])
         form.addRow(_lbl("STT model (Whisper)"), self._stt_model)
@@ -278,7 +324,55 @@ class SettingsDialog(QDialog):
         layout.addLayout(slider_row)
         layout.addStretch()
 
+        # Kick off voice fetch after UI is built
+        threading.Thread(target=self._fetch_voices, daemon=True).start()
+
         return tab
+
+    def _fetch_voices(self):
+        """Fetch ElevenLabs voices in a background thread and populate the combo."""
+        try:
+            from elevenlabs import voices as el_voices
+            voice_list = el_voices()
+            # Marshal back to main thread via a simple approach
+            self._voice_combo.clear()
+            saved_id = os.getenv("ELEVENLABS_VOICE_ID", "")
+            selected_idx = 0
+            for i, v in enumerate(voice_list):
+                self._voice_combo.addItem(v.name, v.voice_id)
+                if v.voice_id == saved_id:
+                    selected_idx = i
+            self._voice_combo.setCurrentIndex(selected_idx)
+            self._voice_combo.setEnabled(True)
+            self._preview_btn.setEnabled(True)
+            logger.info(f"Loaded {len(voice_list)} ElevenLabs voices")
+        except Exception as e:
+            self._voice_combo.clear()
+            self._voice_combo.addItem("Could not load voices", "")
+            self._voice_combo.setEnabled(False)
+            self._preview_btn.setEnabled(False)
+            logger.warning(f"Could not fetch ElevenLabs voices: {e}")
+
+    def _preview_voice(self):
+        """Play a short TTS sample with the currently selected voice."""
+        voice_id = self._voice_combo.currentData()
+        if not voice_id:
+            return
+        self._preview_btn.setEnabled(False)
+        self._preview_btn.setText("Playing…")
+
+        def _play():
+            try:
+                from tts import EdwardTTS
+                tts = EdwardTTS(voice_id=voice_id)
+                tts.speak("Hello, I'm Edward, your AI assistant.", stream_audio=True)
+            except Exception as e:
+                logger.warning(f"Voice preview failed: {e}")
+            finally:
+                self._preview_btn.setEnabled(True)
+                self._preview_btn.setText("Preview")
+
+        threading.Thread(target=_play, daemon=True).start()
 
     # ── Hotkeys tab ───────────────────────────────────────────────────────────
 
@@ -352,7 +446,7 @@ class SettingsDialog(QDialog):
     def _load(self):
         self._username.setText(os.getenv("USER_NAME", ""))
         self._tts_enabled.setChecked(os.getenv("TTS_ENABLED", "false").lower() == "true")
-        self._voice_id.setText(os.getenv("ELEVENLABS_VOICE_ID", ""))
+        # voice combo populated by _fetch_voices thread — selection set there
         stt = os.getenv("STT_MODEL", "base")
         idx = self._stt_model.findText(stt)
         self._stt_model.setCurrentIndex(max(idx, 0))
@@ -373,7 +467,8 @@ class SettingsDialog(QDialog):
     def _on_save(self):
         self._save_env("USER_NAME",            self._username.text().strip() or "User")
         self._save_env("TTS_ENABLED",          str(self._tts_enabled.isChecked()).lower())
-        self._save_env("ELEVENLABS_VOICE_ID",  self._voice_id.text().strip())
+        voice_id = self._voice_combo.currentData() or ""
+        self._save_env("ELEVENLABS_VOICE_ID",  voice_id)
         self._save_env("STT_MODEL",            self._stt_model.currentText())
         self._save_env("WAKE_WORD_ENABLED",    str(self._wake_enabled.isChecked()).lower())
         self._save_env("WAKE_WORD_THRESHOLD",  f"{self._threshold_slider.value() / 100:.2f}")
