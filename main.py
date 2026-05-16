@@ -23,6 +23,7 @@ from PIL import Image, ImageDraw
 from agent import EdwardAgent
 from overlay import EdwardOverlay
 from tts import get_tts
+from widgets.acting_indicator import ActingIndicator
 from stt import get_stt
 from api_client import get_api_client
 from config import USER_NAME, COLORS
@@ -72,6 +73,7 @@ class Edward:
         
         # Initialize components
         self.overlay = EdwardOverlay()
+        self.acting_indicator = ActingIndicator()
         self.agent = EdwardAgent(on_trigger_callback=self._on_hotkey_triggered)
         self.tts = get_tts()
         self.stt = get_stt()
@@ -162,6 +164,7 @@ class Edward:
             question: User's question
             screenshot_base64: Base64-encoded screenshot (optional)
         """
+        self.acting_indicator.show_acting()
         try:
             # Clear previous response
             self.overlay.response_area.clear()
@@ -198,6 +201,7 @@ class Edward:
             self.overlay.set_response(error_msg)
         
         finally:
+            self.acting_indicator.hide_acting()
             # Re-enable input
             self.overlay.enable_input()
     

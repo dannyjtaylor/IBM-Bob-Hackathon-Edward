@@ -15,6 +15,7 @@ from PySide6.QtSvg import QSvgRenderer
 
 from config import COLORS, OVERLAY_WIDTH, OVERLAY_ANIMATION_DURATION, OVERLAY_OPACITY
 from logger import get_logger
+from widgets.listening_indicator import ListeningIndicator
 
 # Setup logging
 logger = get_logger(__name__)
@@ -136,7 +137,12 @@ class EdwardOverlay(QMainWindow):
         self.status_label.setStyleSheet(f"color: {COLORS['silver']}; padding: 5px;")
         self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.status_label)
-        
+
+        # Listening indicator (hidden until mic is active)
+        self.listening_indicator = ListeningIndicator(central_widget)
+        self.listening_indicator.hide()
+        layout.addWidget(self.listening_indicator, alignment=Qt.AlignmentFlag.AlignCenter)
+
         # Response display area (scrollable)
         self.response_area = QTextEdit()
         self.response_area.setReadOnly(True)
@@ -343,15 +349,25 @@ class EdwardOverlay(QMainWindow):
         self.response_area.clear()
         self.screenshot_data = None
     
+    def show_listening(self):
+        """Show listening indicator when mic is active"""
+        self.listening_indicator.show()
+        self.listening_indicator.start_animation()
+
+    def hide_listening(self):
+        """Hide listening indicator (fades out then hides)"""
+        self.listening_indicator.stop_animation()
+
     def _on_mic_clicked(self):
         """Handle microphone button click"""
         logger.info("Microphone button clicked")
-        
+
         # Disable buttons while listening
         self.mic_button.setEnabled(False)
         self.ask_button.setEnabled(False)
         self.input_field.setEnabled(False)
         self.set_status("🎤 Listening... Speak now!")
+        self.show_listening()
         
         # Emit signal to start listening (will be handled by main.py)
         # For now, just re-enable after a moment
@@ -417,6 +433,7 @@ class EdwardOverlay(QMainWindow):
     
     def enable_input(self):
         """Re-enable input field and buttons after processing"""
+        self.hide_listening()
         self.input_field.setEnabled(True)
         self.ask_button.setEnabled(True)
         self.mic_button.setEnabled(True)
