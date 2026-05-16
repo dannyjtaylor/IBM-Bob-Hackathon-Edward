@@ -27,6 +27,7 @@ from widgets.acting_indicator import ActingIndicator
 from stt import get_stt
 from api_client import get_api_client
 from context_enhancer import get_context_enhancer
+from ui import PasswordUnlockDialog, PasswordManagerDialog
 from config import USER_NAME, COLORS
 from logger import setup_logger
 
@@ -278,6 +279,7 @@ In the meantime, I can provide basic responses. How can I assist you, {USER_NAME
         # Create menu
         menu = pystray.Menu(
             pystray.MenuItem('Show Edward', self._show_overlay),
+            pystray.MenuItem('Password Vault', self._show_password_vault),
             pystray.MenuItem('Settings', self._show_settings),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem('Exit', self._quit_app)
@@ -295,6 +297,15 @@ In the meantime, I can provide basic responses. How can I assist you, {USER_NAME
         """Show overlay from tray menu"""
         self.overlay.show_overlay()
     
+    def _show_password_vault(self):
+        """Open password vault — prompt for master password then show manager."""
+        unlock = PasswordUnlockDialog()
+        if unlock.exec() != PasswordUnlockDialog.DialogCode.Accepted:
+            return
+        vault = unlock.get_vault()
+        if vault:
+            PasswordManagerDialog(vault).exec()
+
     def _show_settings(self):
         """Show settings dialog (placeholder)"""
         logger.info("Settings clicked (not implemented yet)")
