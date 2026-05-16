@@ -20,11 +20,48 @@ load_dotenv()
 logger = get_logger(__name__)
 
 
-_SYSTEM_PROMPT = (
-    "You are Edward, the FullCUDA Alchemist — brilliant, direct, GPU-accelerated. "
-    "Help the user with their computer tasks using equivalent exchange. "
-    "When given a screenshot, analyse it carefully and provide specific, actionable advice."
-)
+_SYSTEM_PROMPT = """\
+You are Edward, the FullCUDA Alchemist — brilliant, direct, GPU-accelerated assistant.
+You can DIRECTLY CONTROL the user's computer: move the mouse, click, type, and press keys.
+
+═══ COMPUTER CONTROL — ACTION SYNTAX ═══
+Include action tags anywhere in your response to take control of the computer.
+Edward's runtime will parse and execute them automatically.
+
+[ACTION:mouse_move(x,y)]              — move mouse to screen coordinates
+[ACTION:mouse_click(x,y)]             — left-click at (x, y)
+[ACTION:mouse_double_click(x,y)]      — double-click at (x, y)
+[ACTION:mouse_right_click(x,y)]       — right-click at (x, y)
+[ACTION:type_text("text to type")]    — type text into focused field
+[ACTION:key_press("ctrl+c")]          — keyboard shortcut (ctrl, shift, alt, enter, tab, esc…)
+[ACTION:scroll(x,y,"down",3)]         — scroll at (x,y) — direction "up"/"down", amount 1–10
+
+═══ COORDINATE RULES ═══
+• Coordinates are SCREEN PIXELS on the actual monitor
+• The coordinate map below shows the exact formula — always use it
+• NEVER exceed the SCREEN BOUNDS shown in the coordinate map (e.g. x > 1920 on a 1920-wide screen is invalid)
+• Aim for the CENTER of buttons, input fields, and icons
+
+═══ WHEN TO ACT ═══
+• If the user says "click X", "open Y", "type Z", "go to…", "scroll down" — execute it
+• Chain actions naturally: move → click → type → enter
+• Briefly explain what you're doing, then include the action tag(s)
+• Do NOT ask for permission for simple, reversible actions (click, type, scroll)
+
+═══ EXAMPLES ═══
+User: "click the search bar"
+You: I'll click the search bar for you. [ACTION:mouse_click(960,45)]
+
+User: "type hello world"
+You: Typing now. [ACTION:type_text("hello world")]
+
+User: "close this window"
+You: Closing with Alt+F4. [ACTION:key_press("alt+f4")]
+
+User: "scroll down"
+You: Scrolling down. [ACTION:scroll(960,540,"down",5)]
+═══════════════════════════════════════
+"""
 
 
 # ── Image compression shared by all backends ──────────────────────────────────
@@ -41,6 +78,59 @@ def _compress_image(b64: str, max_side: int = 768) -> tuple[bytes, str]:
     img.save(buf, "JPEG", quality=82)
     data = buf.getvalue()
     return data, base64.b64encode(data).decode()
+
+
+def _build_coord_context(compressed_bytes: bytes, region: Optional[dict]) -> str:
+    """
+    Build the coordinate-mapping context string that tells the model how to convert
+    image pixel positions into real screen coordinates.
+
+    Formula: screen_x = region_left + image_x * (region_w / img_w)
+             screen_y = region_top  + image_y * (region_h / img_h)
+
+    For full-screen mode region_left/top are 0 and the scale is > 1.
+    For cursor-region mode region_left/top are non-zero and scale is ~1.
+    """
+    try:
+        import io as _io
+        from PIL import Image as _Image
+        comp_img = _Image.open(_io.BytesIO(compressed_bytes))
+        iw, ih = comp_img.width, comp_img.height
+
+        if region:
+            rl  = region.get("left",     0)
+            rt  = region.get("top",      0)
+            rw  = region.get("reg_w",    iw)
+            rh  = region.get("reg_h",    ih)
+            cx  = region.get("cursor_x", None)
+            cy  = region.get("cursor_y", None)
+            sw  = region.get("screen_w", None)
+            sh  = region.get("screen_h", None)
+            sx  = round(rw / iw, 3)
+            sy  = round(rh / ih, 3)
+
+            screen_note = (
+                f"\n SCREEN BOUNDS: x must be 0–{sw}, y must be 0–{sh}  ← never exceed these"
+                if sw and sh else ""
+            )
+            cursor_note = (
+                f"\n Current cursor: ({cx}, {cy}) — shown as gold crosshair"
+                if cx is not None else ""
+            )
+            return (
+                f"\n[COORDINATE MAP — image {iw}×{ih}px covers screen region "
+                f"({rl},{rt})→({rl+rw},{rt+rh})\n"
+                f" To convert image (ix,iy) → screen: "
+                f"screen_x = {rl} + ix × {sx},  screen_y = {rt} + iy × {sy}"
+                f"{screen_note}{cursor_note}]"
+            )
+        else:
+            return (
+                f"\n[Image: {iw}×{ih}px — no region info available; "
+                f"use the crosshair as the cursor reference]"
+            )
+    except Exception:
+        return ""
 
 
 # ── Google Gemini backend (default — fast, free, multimodal) ──────────────────
@@ -81,6 +171,7 @@ class GeminiBackend:
         self,
         question: str,
         screenshot_b64: Optional[str] = None,
+        region_info: Optional[dict] = None,
     ) -> AsyncGenerator[str, None]:
         if not self.api_key:
             yield (
@@ -96,10 +187,12 @@ class GeminiBackend:
             client = self._get_client()
 
             contents: list = []
+            screen_ctx = ""
             if screenshot_b64:
                 raw_bytes, _ = _compress_image(screenshot_b64)
                 contents.append(types.Part.from_bytes(data=raw_bytes, mime_type="image/jpeg"))
-            contents.append(_SYSTEM_PROMPT + "\n\n" + question)
+                screen_ctx = _build_coord_context(raw_bytes, region_info)
+            contents.append(_SYSTEM_PROMPT + screen_ctx + "\n\n" + question)
 
             model_id = self.model_id
             queue: asyncio.Queue = asyncio.Queue()
@@ -137,30 +230,27 @@ class GeminiBackend:
             yield f"\n[{err}]"
 
 
-# ── moondream2 backend (local, CUDA-accelerated, ~2 GB) ───────────────────────
+# ── moondream backend (cloud API, v1.2+) ──────────────────────────────────────
 
 class MoondreamBackend:
     name = "moondream"
     supports_vision = True
 
     def __init__(self):
+        self._api_key = os.getenv("MOONDREAM_API_KEY", "")
         self._model = None
-        self._loading = False
 
-    def _load_model(self):
-        if self._model is None and not self._loading:
-            self._loading = True
-            logger.info("Loading moondream2 (~2 GB — first run downloads the model)…")
+    def _get_model(self):
+        if self._model is None:
             import moondream as md
-            self._model = md.vl(model="vikhyatk/moondream2")
-            logger.info("moondream2 ready")
-            self._loading = False
+            self._model = md.vl(api_key=self._api_key)
+            logger.info("moondream cloud client ready")
         return self._model
 
     def is_available(self) -> bool:
         try:
             import moondream  # noqa: F401
-            return True
+            return bool(self._api_key)
         except ImportError:
             return False
 
@@ -169,23 +259,37 @@ class MoondreamBackend:
         question: str,
         screenshot_b64: Optional[str] = None,
     ) -> AsyncGenerator[str, None]:
+        if not self._api_key:
+            yield (
+                "[Moondream API key missing — add MOONDREAM_API_KEY to your .env file. "
+                "Get a free key at https://moondream.ai]\n"
+            )
+            return
+
         try:
             loop = asyncio.get_event_loop()
-            model = await loop.run_in_executor(None, self._load_model)
+            model = await loop.run_in_executor(None, self._get_model)
 
             if screenshot_b64:
                 raw_bytes, _ = _compress_image(screenshot_b64, max_side=512)
                 pil_image    = Image.open(io.BytesIO(raw_bytes))
 
                 def _infer():
-                    enc = model.encode_image(pil_image)
-                    return model.query(enc, question)["answer"]
+                    out = model.query(image=pil_image, question=question)
+                    # Cloud API returns a dict; local/typed API returns QueryOutput
+                    if isinstance(out, dict):
+                        answer = out.get("answer", "")
+                    else:
+                        answer = out.answer
+                    if isinstance(answer, str):
+                        return answer
+                    return "".join(answer)
 
                 result = await loop.run_in_executor(None, _infer)
             else:
                 result = (
                     "I'm moondream — a vision model. "
-                    "Press Ctrl+R to capture a screenshot so I can see what you're working on!"
+                    "Capture a screenshot (Ctrl+R or Win+Shift+E) so I can see your screen!"
                 )
 
             yield result
@@ -263,7 +367,7 @@ _BACKEND_REGISTRY: dict[str, type] = {
 
 BACKEND_LABELS = {
     "gemini":    "GEMINI 2.5",
-    "moondream": "MOONDREAM 2",
+    "moondream": "MOONDREAM",
     "ollama":    "OLLAMA",
 }
 
@@ -319,12 +423,21 @@ class EdwardAIClient:
         self,
         question:          str,
         screenshot_base64: Optional[str] = None,
-        stream:            bool = True,      # kept for API compatibility
+        stream:            bool = True,
+        region_info:       Optional[dict] = None,
+        raw_question:      Optional[str] = None,
     ) -> AsyncGenerator[str, None]:
         backend = self.active_backend
-        logger.info(f"⚡ {backend.name} ← {question[:60]}…")
-        async for chunk in backend.ask(question, screenshot_base64):
-            yield chunk
+        # Moondream is a simple vision API — send only the raw question, not the
+        # context-enhanced prompt (which adds clipboard/screen boilerplate it can't use).
+        effective_q = raw_question if (raw_question and backend.name == "moondream") else question
+        logger.info(f"⚡ {backend.name} ← {effective_q[:60]}…")
+        if hasattr(backend, 'ask') and 'region_info' in backend.ask.__code__.co_varnames:
+            async for chunk in backend.ask(effective_q, screenshot_base64, region_info=region_info):
+                yield chunk
+        else:
+            async for chunk in backend.ask(effective_q, screenshot_base64):
+                yield chunk
 
 
 # ── Singleton ─────────────────────────────────────────────────────────────────

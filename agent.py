@@ -49,6 +49,7 @@ class EdwardAgent:
         # HWND of the window that was foreground when Win+Shift+E fired.
         # Used by capture_active_window so it never accidentally captures the overlay.
         self._target_hwnd: Optional[int] = None
+        self.last_region: dict = {}   # populated after every capture; used for coord context
         logger.info("Edward Agent initialised — multi-mode capture ready")
 
     # ── Public capture API ────────────────────────────────────────────────────
@@ -59,6 +60,7 @@ class EdwardAgent:
         """
         Capture a screenshot using the given mode (or self.screenshot_mode).
         Returns (image_bytes, base64_string).
+        Also updates self.last_region with coordinate-mapping info.
         """
         mode = mode or self.screenshot_mode
         if mode == ScreenshotMode.CURSOR_REGION:
@@ -68,6 +70,11 @@ class EdwardAgent:
         else:
             img_bytes, img_base64 = self.capture_full_screen()
         return img_bytes, img_base64
+
+    def get_cursor_pos(self) -> Tuple[int, int]:
+        """Return the current screen cursor position."""
+        x, y = self.mouse.position
+        return int(x), int(y)
 
     def capture_cursor_region(
         self, region_size: int = 1000
@@ -105,6 +112,19 @@ class EdwardAgent:
                 img_bytes  = self._to_bytes(img)
                 img_base64 = base64.b64encode(img_bytes).decode()
 
+                self.last_region = {
+                    "mode":      "cursor_region",
+                    "left":      left,
+                    "top":       top,
+                    "reg_w":     right - left,
+                    "reg_h":     bottom - top,
+                    "cursor_x":  cursor_x,
+                    "cursor_y":  cursor_y,
+                    "img_w":     shot.width,
+                    "img_h":     shot.height,
+                    "screen_w":  screen_w,
+                    "screen_h":  screen_h,
+                }
                 logger.info(f"Cursor-region shot: {shot.width}×{shot.height} @ ({cursor_x},{cursor_y})")
                 return img_bytes, img_base64, (cursor_x, cursor_y)
 
@@ -148,6 +168,20 @@ class EdwardAgent:
                 img_bytes  = self._to_bytes(img)
                 img_base64 = base64.b64encode(img_bytes).decode()
 
+                cx, cy = self.mouse.position
+                self.last_region = {
+                    "mode":     "active_window",
+                    "left":     left,
+                    "top":      top,
+                    "reg_w":    width,
+                    "reg_h":    height,
+                    "cursor_x": int(cx),
+                    "cursor_y": int(cy),
+                    "img_w":    shot.width,
+                    "img_h":    shot.height,
+                    "screen_w": monitor['width'],
+                    "screen_h": monitor['height'],
+                }
                 logger.info(f"Active-window shot: {width}×{height}")
                 return img_bytes, img_base64
 
@@ -169,6 +203,20 @@ class EdwardAgent:
                 img_bytes  = self._to_bytes(img)
                 img_base64 = base64.b64encode(img_bytes).decode()
 
+                cx, cy = self.mouse.position
+                self.last_region = {
+                    "mode":     "full_screen",
+                    "left":     0,
+                    "top":      0,
+                    "reg_w":    shot.width,
+                    "reg_h":    shot.height,
+                    "cursor_x": int(cx),
+                    "cursor_y": int(cy),
+                    "img_w":    shot.width,
+                    "img_h":    shot.height,
+                    "screen_w": shot.width,
+                    "screen_h": shot.height,
+                }
                 logger.info(f"Full-screen shot: {shot.width}×{shot.height}")
                 return img_bytes, img_base64
 

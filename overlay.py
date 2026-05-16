@@ -5,6 +5,7 @@ Features: animated alchemy circle, screenshot-mode selector, live thumbnail,
 real-time STT display, blueprint response area, glow effects.
 """
 
+import re
 import sys
 from typing import Optional
 
@@ -17,7 +18,7 @@ from PySide6.QtCore import (
     Signal as pyqtSignal, Slot,
 )
 from PySide6.QtGui import (
-    QColor, QFont, QFontDatabase, QPainter, QPen, QPixmap,
+    QColor, QCursor, QFont, QFontDatabase, QPainter, QPen, QPixmap,
     QScreen, QIcon, QLinearGradient, QBrush,
 )
 from PySide6.QtSvg import QSvgRenderer
@@ -28,6 +29,17 @@ from widgets.alchemy_circle import AlchemyCircle
 from widgets.listening_indicator import ListeningIndicator
 
 logger = get_logger(__name__)
+
+
+def _strip_md(text: str) -> str:
+    """Remove markdown markers and action tags so they don't appear as raw symbols."""
+    text = re.sub(r'\[ACTION:[^\]]*\]', '', text)       # [ACTION:...] tags
+    text = re.sub(r'\*\*([^*]+)\*\*', r'\1', text)     # **bold**
+    text = re.sub(r'\*([^*]+)\*', r'\1', text)          # *italic*
+    text = re.sub(r'`{1,3}([^`]*)`{1,3}', r'\1', text) # `code`
+    text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)  # headers
+    return text
+
 
 # ── Colour helpers ────────────────────────────────────────────────────────────
 GOLD   = COLORS['gold']
@@ -58,6 +70,56 @@ def _mic_icon(color: str = GOLD, size: int = 20) -> QIcon:
       <path d="M19 10V12C19 15.866 15.866 19 12 19C8.134 19 5 15.866 5 12V10"
             stroke="{color}" stroke-width="1.5" stroke-linecap="round"/>
       <path d="M12 19V23M8 23H16" stroke="{color}" stroke-width="1.5" stroke-linecap="round"/>
+    </svg>'''
+    return _svg_icon(svg, size)
+
+
+def _cursor_icon(color: str = GOLD, size: int = 18) -> QIcon:
+    """Crosshair with centre dot — represents cursor/region mode."""
+    svg = f'''<svg width="{size}" height="{size}" viewBox="0 0 24 24" fill="none"
+               xmlns="http://www.w3.org/2000/svg">
+      <circle cx="12" cy="12" r="2.5" fill="{color}"/>
+      <circle cx="12" cy="12" r="6" stroke="{color}" stroke-width="1.5"/>
+      <line x1="12" y1="2"  x2="12" y2="5"  stroke="{color}" stroke-width="1.5" stroke-linecap="round"/>
+      <line x1="12" y1="19" x2="12" y2="22" stroke="{color}" stroke-width="1.5" stroke-linecap="round"/>
+      <line x1="2"  y1="12" x2="5"  y2="12" stroke="{color}" stroke-width="1.5" stroke-linecap="round"/>
+      <line x1="19" y1="12" x2="22" y2="12" stroke="{color}" stroke-width="1.5" stroke-linecap="round"/>
+    </svg>'''
+    return _svg_icon(svg, size)
+
+
+def _window_icon(color: str = GOLD, size: int = 18) -> QIcon:
+    """Browser-style window — represents active window mode."""
+    svg = f'''<svg width="{size}" height="{size}" viewBox="0 0 24 24" fill="none"
+               xmlns="http://www.w3.org/2000/svg">
+      <rect x="2" y="4" width="20" height="16" rx="1.5" stroke="{color}" stroke-width="1.5"/>
+      <line x1="2" y1="9" x2="22" y2="9" stroke="{color}" stroke-width="1.5"/>
+      <circle cx="5.5" cy="6.5" r="1" fill="{color}"/>
+      <circle cx="8.5" cy="6.5" r="1" fill="{color}"/>
+      <circle cx="11.5" cy="6.5" r="1" fill="{color}"/>
+    </svg>'''
+    return _svg_icon(svg, size)
+
+
+def _monitor_icon(color: str = GOLD, size: int = 18) -> QIcon:
+    """Desktop monitor — represents full-screen mode."""
+    svg = f'''<svg width="{size}" height="{size}" viewBox="0 0 24 24" fill="none"
+               xmlns="http://www.w3.org/2000/svg">
+      <rect x="2" y="3" width="20" height="14" rx="1.5" stroke="{color}" stroke-width="1.5"/>
+      <line x1="8"  y1="21" x2="16" y2="21" stroke="{color}" stroke-width="1.5" stroke-linecap="round"/>
+      <line x1="12" y1="17" x2="12" y2="21" stroke="{color}" stroke-width="1.5" stroke-linecap="round"/>
+      <rect x="5" y="6" width="14" height="8" rx="0.5" stroke="{color}" stroke-width="1" opacity="0.5"/>
+    </svg>'''
+    return _svg_icon(svg, size)
+
+
+def _bolt_icon(color: str = RED, size: int = 18) -> QIcon:
+    """Clean SVG lightning bolt — for the TRANSMUTE button."""
+    svg = f'''<svg width="{size}" height="{size}" viewBox="0 0 24 24" fill="none"
+               xmlns="http://www.w3.org/2000/svg">
+      <path d="M13 2L4.5 13.5H10.5L9 22L19.5 10.5H13.5L13 2Z"
+            fill="{color}" stroke="{color}" stroke-width="0.5"
+            stroke-linejoin="round"/>
     </svg>'''
     return _svg_icon(svg, size)
 
@@ -272,6 +334,12 @@ class EdwardOverlay(QMainWindow):
         self._refresh_timer.setInterval(4000)
         self._refresh_timer.timeout.connect(self._periodic_refresh)
 
+        # Live cursor position — updates at ~20 fps
+        self._cursor_timer = QTimer(self)
+        self._cursor_timer.setInterval(50)
+        self._cursor_timer.timeout.connect(self._update_cursor_label)
+        self._cursor_timer.start()
+
         # Start alchemy circle
         self.alchemy_circle.start()
 
@@ -317,6 +385,7 @@ class EdwardOverlay(QMainWindow):
         layout.addLayout(self._build_header())
         layout.addWidget(_GoldLine())
         layout.addLayout(self._build_mode_selector())
+        layout.addWidget(self._build_cursor_strip())
         layout.addLayout(self._build_backend_selector())
         layout.addWidget(self._build_thumbnail())
         layout.addWidget(self._build_response_area(), stretch=3)
@@ -368,19 +437,23 @@ class EdwardOverlay(QMainWindow):
         row.setSpacing(4)
 
         modes = [
-            (ScreenshotMode.CURSOR_REGION, "⊙ CURSOR\nFAST",   "Fast — focused region around mouse"),
-            (ScreenshotMode.ACTIVE_WINDOW, "▣ WINDOW\nMED",    "Medium — current foreground window"),
-            (ScreenshotMode.FULL_SCREEN,   "⬜ SCREEN\nSLOW",  "Slow — all monitors"),
+            (ScreenshotMode.CURSOR_REGION, "CURSOR\nFAST",  "Fast — focused region around mouse", _cursor_icon),
+            (ScreenshotMode.ACTIVE_WINDOW, "WINDOW\nMED",   "Medium — current foreground window",  _window_icon),
+            (ScreenshotMode.FULL_SCREEN,   "SCREEN\nSLOW",  "Slow — all monitors",                 _monitor_icon),
         ]
 
         self._mode_btns: dict[ScreenshotMode, QPushButton] = {}
-        for mode, label_text, tip in modes:
+        self._mode_icons: dict[ScreenshotMode, object] = {}
+        for mode, label_text, tip, icon_fn in modes:
             btn = QPushButton(label_text)
+            btn.setIcon(icon_fn(GOLD, 16))
+            btn.setIconSize(QSize(16, 16))
             btn.setToolTip(tip)
             btn.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
             btn.setMinimumHeight(40)
             btn.pressed.connect(lambda m=mode: self._select_mode(m))
             self._mode_btns[mode] = btn
+            self._mode_icons[mode] = icon_fn
             row.addWidget(btn)
 
         self._select_mode(ScreenshotMode.CURSOR_REGION, emit=False)
@@ -390,11 +463,46 @@ class EdwardOverlay(QMainWindow):
         wrapper.addLayout(col)
         return wrapper
 
+    # ── Live cursor position strip ────────────────────────────────────────────
+
+    def _build_cursor_strip(self) -> QWidget:
+        strip = QWidget()
+        strip.setFixedHeight(22)
+        strip.setStyleSheet(f"background: #0A0A0A; border: 1px solid #2A2000;")
+        row = QHBoxLayout(strip)
+        row.setContentsMargins(8, 0, 8, 0)
+        row.setSpacing(0)
+
+        icon_lbl = QLabel("⊕")
+        icon_lbl.setFont(QFont("Consolas", 8))
+        icon_lbl.setStyleSheet(f"color: {GOLD}; background: transparent; border: none;")
+        row.addWidget(icon_lbl)
+
+        row.addSpacing(6)
+
+        self.cursor_pos_label = QLabel("X: —    Y: —")
+        self.cursor_pos_label.setFont(QFont("Consolas", 9))
+        self.cursor_pos_label.setStyleSheet(
+            f"color: {GOLD}; background: transparent; border: none; letter-spacing: 1px;"
+        )
+        row.addWidget(self.cursor_pos_label)
+        row.addStretch()
+
+        return strip
+
+    def _update_cursor_label(self):
+        pos = QCursor.pos()
+        self.cursor_pos_label.setText(f"X: {pos.x():>5}    Y: {pos.y():>5}")
+
     def _select_mode(self, mode: ScreenshotMode, emit: bool = True):
         self._current_mode = mode
         for m, btn in self._mode_btns.items():
-            btn.setChecked(m == mode)
-            btn.setStyleSheet(_MODE_CHECKED if m == mode else _MODE_UNCHECKED)
+            checked = (m == mode)
+            btn.setChecked(checked)
+            btn.setStyleSheet(_MODE_CHECKED if checked else _MODE_UNCHECKED)
+            # Flip icon colour so it stays visible against the button background
+            icon_color = BG if checked else GOLD
+            btn.setIcon(self._mode_icons[m](icon_color, 16))
         if emit:
             logger.info(f"Screenshot mode → {mode.value}")
             self.screenshot_mode_changed.emit(mode)
@@ -557,7 +665,7 @@ class EdwardOverlay(QMainWindow):
 
         # Mic / listen
         self.mic_button = QPushButton(" LISTEN")
-        self.mic_button.setIcon(_mic_icon(BG, 18))
+        self.mic_button.setIcon(_mic_icon(GOLD, 18))
         self.mic_button.setIconSize(QSize(18, 18))
         self.mic_button.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
         self.mic_button.setMinimumHeight(48)
@@ -567,7 +675,9 @@ class EdwardOverlay(QMainWindow):
         row.addWidget(self.mic_button, stretch=1)
 
         # Transmute / ask
-        self.ask_button = QPushButton("⚡  TRANSMUTE")
+        self.ask_button = QPushButton("  TRANSMUTE")
+        self.ask_button.setIcon(_bolt_icon(RED, 20))
+        self.ask_button.setIconSize(QSize(20, 20))
         self.ask_button.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
         self.ask_button.setMinimumHeight(48)
         self.ask_button.setStyleSheet(_TRANSMUTE_BUTTON)
@@ -690,12 +800,12 @@ class EdwardOverlay(QMainWindow):
     # ── Response helpers ──────────────────────────────────────────────────────
 
     def append_response(self, text: str):
-        self.response_area.insertPlainText(text)
+        self.response_area.insertPlainText(_strip_md(text))
         sb = self.response_area.verticalScrollBar()
         sb.setValue(sb.maximum())
 
     def set_response(self, text: str):
-        self.response_area.setPlainText(text)
+        self.response_area.setPlainText(_strip_md(text))
 
     # ── Event handlers ────────────────────────────────────────────────────────
 

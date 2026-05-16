@@ -94,7 +94,7 @@ class WakeWordDetector:
             mic = sr.Microphone()
             with mic as source:
                 logger.info("Calibrating microphone for wake word detection…")
-                recognizer.adjust_for_ambient_noise(source, duration=1.5)
+                recognizer.adjust_for_ambient_noise(source, duration=0.8)
         except Exception as e:
             logger.error(f"Microphone init failed: {e}")
             return
@@ -104,14 +104,14 @@ class WakeWordDetector:
                 return
             try:
                 text = r.recognize_google(audio).lower().strip()
-                logger.debug(f"Wake poll heard: {text!r}")
+                logger.info(f"Wake poll heard: {text!r}")  # visible so user can see what's heard
                 self._check_and_fire(text)
             except sr.UnknownValueError:
-                pass
+                pass  # silence / unintelligible
             except sr.RequestError as e:
                 logger.warning(f"STT request error: {e}")
 
-        stop_fn = recognizer.listen_in_background(mic, _callback, phrase_time_limit=6)
+        stop_fn = recognizer.listen_in_background(mic, _callback, phrase_time_limit=4)
         logger.info(f"STT wake word loop active. Say one of: {WAKE_WORDS}")
 
         while self.is_running:
@@ -168,8 +168,41 @@ class WakeWordDetector:
 
     # ── Shared: check text and fire callback ──────────────────────────────────
 
+    # Google STT mishears "hey ed" in many ways — cast a wide net
+    _PHONETIC_ALIASES = [
+        r"hey\s+ed\b",
+        r"hey\s+add\b",
+        r"hey\s+at\b",
+        r"hey\s+ahead\b",
+        r"hey\s+a\b",
+        r"hey\s+head\b",
+        r"hey\s+dead\b",
+        r"hey\s+red\b",
+        r"hey\s+edward\b",
+        r"hey\s+edwood\b",
+        r"\bedward\b",
+        r"\bed\b(?!\s+(?:a|an|the|is|was|has|have|to|in|on|at|of))",  # "ed" not in sentence
+        r"ok\s+ed\b",
+        r"okay\s+ed\b",
+    ]
+    _WAKE_RE = re.compile(
+        r"(?:" + "|".join(_PHONETIC_ALIASES) + r")[,\.\s]*(.*)$",
+        re.I,
+    )
+
     def _check_and_fire(self, text: str):
         """Check if text contains a wake word, extract trailing command."""
+        m = self._WAKE_RE.search(text)
+        if m:
+            command = m.group(1).strip() or None
+            logger.info(f"Wake word matched in {text!r} — command: {command!r}")
+            if self.on_wake_callback:
+                try:
+                    self.on_wake_callback(command)
+                except Exception as e:
+                    logger.error(f"Wake callback error: {e}")
+            return
+        # also check config WAKE_WORDS as fallback
         for wake in WAKE_WORDS:
             pattern = re.compile(
                 r"(?:^|\b)" + re.escape(wake.lower()) + r"[,\s]*(.*)$",

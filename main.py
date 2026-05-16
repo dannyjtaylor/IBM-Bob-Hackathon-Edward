@@ -12,6 +12,12 @@ import warnings
 warnings.filterwarnings('ignore')
 os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = '1'
 os.environ['PYTHONWARNINGS'] = 'ignore'
+os.environ['HF_HUB_DISABLE_SYMLINKS_WARNING'] = '1'
+
+# Qt 6 sets DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 automatically — no manual call needed.
+# Suppress noisy third-party loggers before any imports that trigger them.
+import logging as _logging
+_logging.getLogger("comtypes").setLevel(_logging.WARNING)
 
 # Suppress NumPy 2.x compatibility warnings
 import numpy as np
@@ -22,7 +28,7 @@ from pathlib import Path
 from typing import Optional
 import asyncio
 from PySide6.QtWidgets import QApplication
-from PySide6.QtCore import QThread, Signal as pyqtSignal, QObject, Slot
+from PySide6.QtCore import QThread, Signal as pyqtSignal, QObject, Slot, QTimer
 import pystray
 from PIL import Image, ImageDraw
 
@@ -37,7 +43,8 @@ from ui import PasswordUnlockDialog, PasswordManagerDialog, SettingsDialog, Conf
 from computer_actions import create_file, edit_file, open_file_or_app
 from local_commands import process as local_process
 from wake_word import WakeWordDetector
-from config import USER_NAME, COLORS, WAKE_WORD_ENABLED
+from mouse_actions import parse_and_execute_actions
+from config import USER_NAME, WAKE_WORD_ENABLED
 from logger import setup_logger
 
 # Setup colored logging
@@ -124,6 +131,8 @@ class Edward:
         self.tray_bridge.show_overlay.connect(self._show_overlay_from_tray)
         self.wake_bridge.detected.connect(self._on_wake_detected_safe)
 
+        self._auto_submit_speech = False   # True when mic was opened by wake word
+
         # Wake word detector — suppress while overlay is visible
         self.wake_detector = WakeWordDetector(
             on_wake_callback=self._on_wake_word_raw,
@@ -155,37 +164,42 @@ class Edward:
         self.overlay.show_overlay(screenshot_data=(img_bytes, img_base64))
     
     def _on_mic_button_clicked(self):
-        """
-        Called when microphone button is clicked.
-        Starts listening for speech input.
-        """
+        """Called when microphone button is clicked (manual). Clears auto-submit flag."""
+        self._auto_submit_speech = False
         logger.info("Starting speech recognition...")
-        
+        self.overlay.set_status("Listening… ⚡")
+
         def on_speech_result(text: Optional[str]):
-            """Callback when speech recognition completes (runs in background thread)"""
-            # Emit signal to safely update UI in main thread
             self.speech_bridge.speech_result.emit(text)
-        
-        # Start listening asynchronously
+
         self.stt.listen_once_async(on_speech_result, timeout=5, phrase_time_limit=15)
-    
+
+    def _start_wake_listen(self):
+        """Called by wake-word handler — mic opens with auto-submit enabled."""
+        self._auto_submit_speech = True
+        self.overlay.set_status("Listening… speak your command ⚡")
+
+        def on_speech_result(text: Optional[str]):
+            self.speech_bridge.speech_result.emit(text)
+
+        self.stt.listen_once_async(on_speech_result, timeout=8, phrase_time_limit=15)
+
     @Slot(object)
     def _on_speech_result_safe(self, text: Optional[str]):
-        """
-        Handle speech recognition result safely in main Qt thread.
-        
-        Args:
-            text: Recognized speech text or None if failed
-        """
+        """Handle speech recognition result on main thread."""
         if text:
             logger.info(f"Speech recognized: {text}")
             self.overlay.input_field.setPlainText(text)
-            self.overlay.set_status("Speech recognized! Click 'Ask Edward' to submit.")
+            if self._auto_submit_speech:
+                self._auto_submit_speech = False
+                self.overlay.set_status("Recognized — transmuting… ⚡")
+                QTimer.singleShot(400, lambda: self._on_question_submitted(text))
+                return
+            self.overlay.set_status("Speech recognized — press Enter or click Ask ⚡")
         else:
             logger.warning("No speech detected")
             self.overlay.set_status("No speech detected. Try again.", error=True)
-        
-        # Re-enable buttons
+
         self.overlay.enable_input()
     
     @Slot(object)
@@ -226,7 +240,7 @@ class Edward:
             else:
                 self.overlay.set_response(local_response)
                 if self.tts.is_enabled and local_response:
-                    self.tts.speak_async(local_response, stream_audio=True)
+                    self.tts.speak_async(local_response)
             self.overlay.enable_input()
             logger.info("Local command handled — skipping Gemma")
             return
@@ -258,34 +272,50 @@ class Edward:
             
             # Ask Gemma 4 (Edward's alchemy!)
             full_response = ""
+            region_info = dict(self.agent.last_region)  # snapshot; includes cursor pos
+            # Always inject live cursor position even if region info is stale
+            cx, cy = self.agent.get_cursor_pos()
+            region_info["cursor_x"] = cx
+            region_info["cursor_y"] = cy
             try:
                 async for chunk in self.gemma_client.ask_question(
-                    question=enhanced_prompt,  # Use enhanced prompt instead of raw question
+                    question=enhanced_prompt,
                     screenshot_base64=screenshot_base64,
-                    stream=True
+                    stream=True,
+                    region_info=region_info if region_info else None,
+                    raw_question=question,
                 ):
                     full_response += chunk
                     self.overlay.append_response(chunk)
-                
-                logger.info(f"⚡ Transmutation complete: {full_response[:100]}...")
-                
+
+                logger.info(f"⚡ Transmutation complete: {full_response[:100]}…")
+
             except Exception as api_error:
-                # Fallback response when Gemma 4 is not available
                 logger.warning(f"⚠️ Gemma 4 unavailable: {api_error}. Using fallback response.")
-                
                 fallback_response = self._generate_fallback_response(question, screenshot_base64)
                 full_response = fallback_response
                 self.overlay.set_response(fallback_response)
-            
-            # Speak response if TTS enabled
+
+            # Execute any [ACTION:...] tags the model included
+            if full_response:
+                clean_text, action_results = parse_and_execute_actions(full_response)
+                if action_results:
+                    logger.info(f"Actions executed: {action_results}")
+                    # Append action feedback to overlay
+                    feedback = "\n\n⚡ Actions taken:\n" + "\n".join(f"  • {r}" for r in action_results)
+                    self.overlay.append_response(feedback)
+
+            # Speak the response (TTS cleans action tags / markdown itself)
             if self.tts.is_enabled and full_response:
                 logger.info("Speaking response...")
-                self.tts.speak_async(full_response, stream_audio=True)
-            
+                self.tts.speak_async(full_response)
+
         except Exception as e:
             error_msg = f"Error processing question: {str(e)}"
             logger.error(error_msg, exc_info=True)
             self.overlay.set_response(error_msg)
+            if self.tts.is_enabled:
+                self.tts.speak_async("Sorry, something went wrong.")
         
         finally:
             self.acting_indicator.hide_acting()
@@ -449,6 +479,11 @@ In the meantime, I can provide basic responses. How can I assist you, {USER_NAME
     def _on_wake_detected_safe(self, command: str):
         """Wake word fired — show overlay, optionally auto-submit command."""
         logger.info(f"Wake word → main thread, command={command!r}")
+        # Save the foreground window BEFORE showing the overlay, same as the hotkey path.
+        # Without this, active-window captures fall back to GetForegroundWindow() which
+        # returns Edward's own panel once it's visible.
+        import ctypes as _ct
+        self.agent._target_hwnd = _ct.windll.user32.GetForegroundWindow()
         try:
             img_bytes, img_base64 = self.agent.capture_for_mode()
         except Exception:
@@ -463,9 +498,8 @@ In the meantime, I can provide basic responses. How can I assist you, {USER_NAME
             self.overlay.input_field.setPlainText(command)
             self._on_question_submitted(command)
         else:
-            # Just the wake word — start listening for the command
-            self.overlay.set_status("Listening… speak your command ⚡")
-            self._on_mic_button_clicked()
+            # Just the wake word — auto-listen and auto-submit when done
+            self._start_wake_listen()
 
     def _request_action_confirmation(self, action_request):
         """
@@ -519,7 +553,7 @@ In the meantime, I can provide basic responses. How can I assist you, {USER_NAME
         
         # Speak result if TTS enabled
         if self.tts.is_enabled:
-            self.tts.speak_async(message, stream_audio=True)
+            self.tts.speak_async(message)
     
     def _on_action_denied(self, action_request):
         """
@@ -534,7 +568,7 @@ In the meantime, I can provide basic responses. How can I assist you, {USER_NAME
         self.overlay.append_response(f"\n\n{message}")
         
         if self.tts.is_enabled:
-            self.tts.speak_async(message, stream_audio=True)
+            self.tts.speak_async(message)
     
     def _execute_action(self, action_request) -> dict:
         """
