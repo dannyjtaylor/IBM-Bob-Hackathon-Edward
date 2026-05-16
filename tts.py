@@ -4,7 +4,7 @@ ElevenLabs TTS with streaming support for faster audio playback
 """
 
 import io
-from typing import Iterator, Optional
+from typing import Optional
 from elevenlabs import generate, stream, Voice, VoiceSettings
 import pygame
 

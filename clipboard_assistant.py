@@ -149,7 +149,7 @@ Please provide a clear, concise response."""
         
         return enhanced_prompt
     
-    def get_smart_suggestions(self, content: str) -> list[str]:
+    def get_smart_suggestions(self, content: str) -> list:
         """
         Get smart action suggestions based on clipboard content.
         

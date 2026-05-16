@@ -43,11 +43,13 @@ class ContextEnhancer:
             Tuple of (enhanced_prompt, context_metadata)
         """
         context_parts = []
-        metadata = {
+        metadata: Dict[str, Any] = {
             'has_screenshot': bool(screenshot_base64),
             'has_clipboard': False,
             'has_history': bool(conversation_history),
-            'clipboard_type': None
+            'clipboard_type': None,
+            'clipboard_included': False,
+            'screenshot_included': bool(screenshot_base64)
         }
         
         # Add screenshot context
@@ -61,6 +63,7 @@ class ContextEnhancer:
                 clipboard_type = self.clipboard.analyze_content_type(clipboard_content)
                 metadata['has_clipboard'] = True
                 metadata['clipboard_type'] = clipboard_type
+                metadata['clipboard_included'] = True
                 
                 # Add clipboard context
                 context_parts.append(f"\nYou recently copied this {clipboard_type}:")

@@ -8,7 +8,7 @@ import os
 import subprocess
 import platform
 from pathlib import Path
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any
 from logger import get_logger
 
 logger = get_logger(__name__)

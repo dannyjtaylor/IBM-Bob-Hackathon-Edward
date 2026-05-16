@@ -154,7 +154,7 @@ class ConfirmationHandler:
                 action_type=action_type,
                 description=f"Create file '{target}' with {len(content)} characters",
                 parameters={
-                    "file_path": target,
+                    "file_path": target or "",
                     "content": content
                 }
             )
@@ -166,7 +166,7 @@ class ConfirmationHandler:
                 action_type=action_type,
                 description=f"Edit file '{target}' (replace with {len(content)} characters)",
                 parameters={
-                    "file_path": target,
+                    "file_path": target or "",
                     "new_content": content
                 }
             )
@@ -176,7 +176,7 @@ class ConfirmationHandler:
                 action_type=action_type,
                 description=f"Open file '{target}'",
                 parameters={
-                    "path": target
+                    "path": target or ""
                 }
             )
         
@@ -185,7 +185,7 @@ class ConfirmationHandler:
                 action_type=action_type,
                 description=f"Open application '{target}'",
                 parameters={
-                    "path": target
+                    "path": target or ""
                 }
             )
         
