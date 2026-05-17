@@ -357,18 +357,213 @@ class OllamaBackend:
             yield f"\n[Ollama error ({type(e).__name__}): {e}]"
 
 
+# ── Shared helpers for hybrid backends ───────────────────────────────────────
+
+_VISION_PROMPT_FULLSCREEN = (
+    "Describe this desktop screenshot for an AI assistant. Include:\n"
+    "- All visible text (window titles, labels, content)\n"
+    "- Open applications and their state\n"
+    "- UI elements (buttons, menus, dialogs, input fields)\n"
+    "- What the user appears to be working on\n"
+    "Be specific and thorough."
+)
+
+_VISION_PROMPT_CURSOR = (
+    "Describe what you see in this desktop screenshot, focusing on the area around "
+    "the gold crosshair/circle — that marks the user's cursor. Include:\n"
+    "- What UI element or content is directly at the cursor (button, text field, link, icon, etc.)\n"
+    "- Visible text near the cursor\n"
+    "- The application or window at the cursor location\n"
+    "- Anything else visible that would help an AI assistant understand the context\n"
+    "Be specific about what is at and near the cursor."
+)
+
+
+async def _ollama_describe_screen(
+    base_url: str,
+    vision_model: str,
+    screenshot_b64: str,
+    region_info: Optional[dict] = None,
+) -> str:
+    """Send screenshot to a local Ollama vision model, return text description."""
+    import httpx
+    # 384px is ideal for moondream (trained on 378px); smaller = faster on CPU
+    _, compressed = _compress_image(screenshot_b64, max_side=384)
+    is_cursor_mode = region_info and region_info.get("mode") == "cursor_region"
+    prompt = _VISION_PROMPT_CURSOR if is_cursor_mode else _VISION_PROMPT_FULLSCREEN
+    payload = {
+        "model":   vision_model,
+        "prompt":  prompt,
+        "images":  [compressed],
+        "stream":  False,
+        "options": {"temperature": 0.1, "num_predict": 120},  # brief description only
+    }
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post(f"{base_url}/api/generate", json=payload)
+        r.raise_for_status()
+        return r.json().get("response", "")
+
+
+# ── Hybrid local: vision model + text model, both via Ollama ─────────────────
+
+class HybridLocalBackend:
+    """
+    Two-model local pipeline:
+      1. OLLAMA_VISION_MODEL (recommended: moondream) describes the screenshot as text.
+         In cursor-region mode it focuses on what's around the gold crosshair.
+      2. OLLAMA_TEXT_MODEL (e.g. llama3.2:3b) handles decision-making and response.
+    The text model never receives raw image bytes — keeps it fast on modest hardware.
+    Pull models with: ollama pull moondream && ollama pull llama3.2:3b
+    """
+    name = "hybrid-local"
+    supports_vision = True
+
+    def __init__(self):
+        self.base_url     = os.getenv("OLLAMA_URL", "http://localhost:11434").rstrip("/")
+        self.vision_model = os.getenv("OLLAMA_VISION_MODEL", "moondream")
+        self.text_model   = os.getenv("OLLAMA_TEXT_MODEL",   "llama3.2:3b")
+
+    def is_available(self) -> bool:
+        import httpx
+        try:
+            r = httpx.get(f"{self.base_url}/api/tags", timeout=3)
+            return r.status_code == 200
+        except Exception:
+            return False
+
+    async def ask(
+        self,
+        question: str,
+        screenshot_b64: Optional[str] = None,
+        region_info: Optional[dict] = None,
+    ) -> AsyncGenerator[str, None]:
+        import httpx
+
+        screen_ctx = ""
+        if screenshot_b64:
+            try:
+                screen_ctx = await _ollama_describe_screen(
+                    self.base_url, self.vision_model, screenshot_b64, region_info
+                )
+                logger.info(f"hybrid-local: vision described screen ({len(screen_ctx)} chars)")
+            except Exception as e:
+                logger.warning(f"hybrid-local: vision model failed ({e}), continuing without screen context")
+
+        is_cursor = region_info and region_info.get("mode") == "cursor_region"
+        cx = region_info.get("cursor_x") if region_info else None
+        cy = region_info.get("cursor_y") if region_info else None
+
+        if screen_ctx:
+            cursor_note = f" (cursor at screen position {cx},{cy})" if cx is not None else ""
+            prompt = (
+                f"{_SYSTEM_PROMPT}\n\n"
+                f"[SCREEN{' — cursor region' if is_cursor else ''}{cursor_note} "
+                f"— described by {self.vision_model}]:\n{screen_ctx}\n\n"
+                f"User: {question}"
+            )
+        else:
+            prompt = f"{_SYSTEM_PROMPT}\n\nUser: {question}"
+
+        payload = {
+            "model":   self.text_model,
+            "prompt":  prompt,
+            "stream":  True,
+            "options": {"temperature": 0.7, "num_predict": 600},
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=90) as client:
+                async with client.stream("POST", f"{self.base_url}/api/generate", json=payload) as resp:
+                    resp.raise_for_status()
+                    async for line in resp.aiter_lines():
+                        if not line:
+                            continue
+                        chunk = json.loads(line)
+                        if "response" in chunk:
+                            yield chunk["response"]
+                        if chunk.get("done"):
+                            break
+        except httpx.ReadTimeout:
+            yield "\n[hybrid-local: text model timed out — try a smaller OLLAMA_TEXT_MODEL ⚡]"
+        except httpx.ConnectError:
+            yield f"\n[hybrid-local: cannot reach Ollama at {self.base_url} ⚡]"
+        except Exception as e:
+            yield f"\n[hybrid-local error ({type(e).__name__}): {e}]"
+
+
+# ── Hybrid cloud: local vision + Gemini Flash for text ───────────────────────
+
+class HybridGeminiBackend:
+    """
+    Fallback two-model pipeline when local text model isn't good enough:
+      1. OLLAMA_VISION_MODEL describes the screenshot locally (no cloud image upload).
+         In cursor-region mode it focuses on what's around the gold crosshair.
+      2. Gemini Flash receives the description as text — faster than sending the image.
+    If the local vision model is unavailable, Gemini handles the image natively.
+    """
+    name = "hybrid-gemini"
+    supports_vision = True
+
+    def __init__(self):
+        self.base_url     = os.getenv("OLLAMA_URL", "http://localhost:11434").rstrip("/")
+        self.vision_model = os.getenv("OLLAMA_VISION_MODEL", "moondream")
+        self._gemini      = GeminiBackend()
+
+    def is_available(self) -> bool:
+        return self._gemini.is_available()
+
+    async def ask(
+        self,
+        question: str,
+        screenshot_b64: Optional[str] = None,
+        region_info: Optional[dict] = None,
+    ) -> AsyncGenerator[str, None]:
+        screen_ctx = ""
+        if screenshot_b64:
+            try:
+                screen_ctx = await _ollama_describe_screen(
+                    self.base_url, self.vision_model, screenshot_b64, region_info
+                )
+                logger.info(f"hybrid-gemini: vision described screen ({len(screen_ctx)} chars)")
+            except Exception as e:
+                logger.warning(f"hybrid-gemini: local vision failed ({e}), falling back to Gemini vision")
+
+        if screen_ctx:
+            is_cursor = region_info and region_info.get("mode") == "cursor_region"
+            cx = region_info.get("cursor_x") if region_info else None
+            cy = region_info.get("cursor_y") if region_info else None
+            cursor_note = f" (cursor at screen position {cx},{cy})" if cx is not None else ""
+            enriched = (
+                f"[SCREEN{' — cursor region' if is_cursor else ''}{cursor_note} "
+                f"— described by local vision model ({self.vision_model})]:\n"
+                f"{screen_ctx}\n\n"
+                f"User: {question}"
+            )
+            # No image — Gemini only gets the text description (faster, no upload)
+            async for chunk in self._gemini.ask(enriched, screenshot_b64=None):
+                yield chunk
+        else:
+            # Local vision unavailable — let Gemini handle image directly
+            async for chunk in self._gemini.ask(question, screenshot_b64, region_info=region_info):
+                yield chunk
+
+
 # ── Multi-backend orchestrator ────────────────────────────────────────────────
 
 _BACKEND_REGISTRY: dict[str, type] = {
-    "gemini":    GeminiBackend,
-    "moondream": MoondreamBackend,
-    "ollama":    OllamaBackend,
+    "gemini":        GeminiBackend,
+    "moondream":     MoondreamBackend,
+    "ollama":        OllamaBackend,
+    "hybrid-local":  HybridLocalBackend,
+    "hybrid-gemini": HybridGeminiBackend,
 }
 
 BACKEND_LABELS = {
-    "gemini":    "GEMINI 2.5",
-    "moondream": "MOONDREAM",
-    "ollama":    "OLLAMA",
+    "gemini":        "GEMINI 2.5",
+    "moondream":     "MOONDREAM",
+    "ollama":        "OLLAMA",
+    "hybrid-local":  "HYBRID LOCAL",
+    "hybrid-gemini": "HYBRID GEMINI",
 }
 
 GEMINI_MODEL_LABELS = {
@@ -387,9 +582,11 @@ class EdwardAIClient:
     def __init__(self, backend_name: str = None):
         preferred = backend_name or os.getenv("AI_BACKEND", "gemini")
         self._backends: dict[str, object] = {
-            "gemini":    GeminiBackend(os.getenv("AI_MODEL", "flash-lite")),
-            "moondream": MoondreamBackend(),
-            "ollama":    OllamaBackend(),
+            "gemini":        GeminiBackend(os.getenv("AI_MODEL", "flash-lite")),
+            "moondream":     MoondreamBackend(),
+            "ollama":        OllamaBackend(),
+            "hybrid-local":  HybridLocalBackend(),
+            "hybrid-gemini": HybridGeminiBackend(),
         }
         self._active_name = preferred
         logger.info(f"EdwardAIClient — active backend: {preferred}")
